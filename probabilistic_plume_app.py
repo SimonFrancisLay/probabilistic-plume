@@ -4,6 +4,9 @@ Flux (conservative) engine with exponential dT weighting, optional diagonals, gr
 source schedules, boundary modes, rectangular adiabatic barrier, background diffusion,
 progress/live updates, snapshot slider, diagnostics, export, and UI helper refactor.
 
+Now includes vertical tilt B: a temperature dependent vertical bias factor V(T) = exp(mu * max(T/T_a - 1, 0)).
+Up directions are multiplied by V, down directions are divided by V.
+
 Run locally:
 1) pip install -r requirements.txt
 2) streamlit run probabilistic_plume_app.py
@@ -58,6 +61,7 @@ class SimParams:
     lambda_per_Ta: float = 1.4        # λ_eff = lambda_per_Ta / T_a
     distance_penalty: bool = True     # diagonals get 1/√2 if True
     disable_gravity: bool = False     # flattens directional priors
+    mu_vertical_tilt: float = 1.0     # NEW: strength of temperature dependent vertical tilt
     # Flux engine control
     beta_transfer: float = 0.3        # fraction of excess exported per step
     # Background diffusion
@@ -140,7 +144,7 @@ def _direction_priors(T_particle: float, params: SimParams) -> Dict[str, float]:
         "up": b,
         "up_left": 0.7 * b, "up_right": 0.7 * b,
         "left": 0.5, "right": 0.5,
-        "down": 0.3, "down_left": 0.2, "down_right": 0.2,
+        "down": 0.2, "down_left": 0.1, "down_right": 0.1,  # slightly reduced default down priors
     }
 
 
@@ -153,17 +157,33 @@ def _distance_penalty(params: SimParams) -> Dict[str, float]:
 
 
 def compute_flux_weights(T_particle: float, T_neighbors: Dict[str, float], *, params: SimParams) -> Dict[str, float]:
+    """Weights for directional flux out of a cell.
+    Exponential ΔT term, directional priors, diagonal penalty, and vertical tilt V(T).
+    Up directions × V, down directions ÷ V, where V = exp(mu * max(T/T_a - 1, 0)).
+    """
     eps = max(0.0, params.epsilon_baseline)
     lam_eff = params.lambda_per_Ta / max(params.T_a, 1e-12)
     P = _direction_priors(T_particle, params)
     C = _distance_penalty(params)
+
+    # Vertical tilt B
+    rel = max(T_particle / max(params.T_a, 1e-12) - 1.0, 0.0)
+    V = float(np.exp(params.mu_vertical_tilt * rel))
+    up_dirs = {"up", "up_left", "up_right"}
+    down_dirs = {"down", "down_left", "down_right"}
+
     w: Dict[str, float] = {}
     for d, Tn in T_neighbors.items():
         if d not in P:
             continue
         dT = T_particle - Tn
         g = np.exp(lam_eff * dT) - 1.0 if dT > 0 else 0.0
-        w[d] = max(0.0, float((eps + g) * P[d] * C.get(d, 1.0)))
+        weight = (eps + g) * P[d] * C.get(d, 1.0)
+        if d in up_dirs:
+            weight *= V
+        elif d in down_dirs and V > 0:
+            weight /= V
+        w[d] = max(0.0, float(weight))
     return w
 
 # =============================
@@ -425,7 +445,7 @@ def request_stop():
     st.session_state.stop_requested = True
 
 st.title("Probabilistic buoyant plume: flux model")
-st.caption("Conservative flux transport with exponential dT weighting. No parcels; optional diffusion.")
+st.caption("Conservative flux transport with exponential dT weighting and temperature dependent vertical tilt.")
 
 with st.sidebar:
     st.header("Controls")
@@ -453,6 +473,7 @@ with st.sidebar:
 
     st.subheader("Flux transfer")
     beta_transfer = st.slider("Export fraction per step β", 0.0, 0.8, 0.3, 0.05)
+    mu_vertical_tilt = st.slider("Vertical tilt μ", 0.0, 3.0, 1.0, 0.1, help="Scales up weights for upward moves and scales down weights for downward moves as T rises above T_a")
 
     boundary_mode = st.selectbox("Boundary mode", ["Outflow", "Blocked", "Periodic"], index=0)
 
@@ -487,6 +508,7 @@ if run_btn:
         source_mode=str(source_mode), tau_g=float(tau_g), plateau_steps=int(plateau_steps), tau_d=float(tau_d),
         allow_diagonals=bool(allow_diagonals), epsilon_baseline=float(epsilon_baseline),
         lambda_per_Ta=float(lambda_per_Ta), distance_penalty=bool(distance_penalty), disable_gravity=bool(disable_gravity),
+        mu_vertical_tilt=float(mu_vertical_tilt),
         beta_transfer=float(beta_transfer), boundary_mode=str(boundary_mode), epsilon_diffusion=float(epsilon_diffusion),
         barrier_enabled=bool(barrier_enabled), barrier_y0=int(barrier_y0), barrier_y1=int(barrier_y1), barrier_x0=int(barrier_x0), barrier_x1=int(barrier_x1),
     )
