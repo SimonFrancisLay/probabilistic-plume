@@ -49,12 +49,17 @@ st.set_page_config(
 class SimParams:
     N: int = 99
     T_a: float = 20.0
-    k: float = 5.0
+    k: float = 5.0  # peak/source multiplier
     alpha: float = 0.5  # mixing fraction
     steps: int = 200
     parcels_per_step: int = 10
     seed: int = 42
     snapshot_stride: int = 10  # take a field snapshot every this many steps
+    # Source scheduling
+    source_mode: str = "Persistent"  # options: Persistent, Grow, Grow-plateau-decay
+    tau_g: float = 20.0  # growth time constant (steps)
+    plateau_steps: int = 50  # plateau duration (steps)
+    tau_d: float = 40.0  # decay time constant (steps)
 
 
 @dataclass
@@ -119,12 +124,12 @@ class Parcel:
     T: float
 
 
-def step_once_persistent(T: np.ndarray, parcels: List[Parcel], params: SimParams, rng: np.random.Generator) -> Tuple[np.ndarray, List[Parcel], Dict[str, float]]:
+def step_once_persistent(T: np.ndarray, parcels: List[Parcel], params: SimParams, rng: np.random.Generator, T_source: float) -> Tuple[np.ndarray, List[Parcel], Dict[str, float]]:
     N = params.N
     c = N // 2
 
-    # Inject r new parcels at the centre with temperature read from T at time t
-    T_source = T[c, c]
+    # Clamp the source cell temperature for this step and inject r new parcels
+    T[c, c] = T_source
     for _ in range(params.parcels_per_step):
         parcels.append(Parcel(c, c, T_source))
 
@@ -189,6 +194,31 @@ def step_once_persistent(T: np.ndarray, parcels: List[Parcel], params: SimParams
     return T_next, final_parcels, diag
 
 
+def source_multiplier(t: int, p: SimParams) -> float:
+    """Return source temperature multiplier s(t) such that T_source(t) = s(t) * T_a.
+    Persistent: s(t) = k.
+    Grow: s(t) = 1 + (k-1)*(1 - exp(-t/tau_g)).
+    Grow-plateau-decay: piecewise growth to k, plateau, then decay back toward 1.
+    """
+    import math
+    if p.source_mode == "Persistent":
+        return p.k
+    if p.source_mode == "Grow":
+        return 1.0 + (p.k - 1.0) * (1.0 - math.exp(-max(t,0) / max(p.tau_g, 1e-9)))
+    # Grow-plateau-decay
+    s_grow = 1.0 + (p.k - 1.0) * (1.0 - math.exp(-max(t,0) / max(p.tau_g, 1e-9)))
+    # define plateau start when within 99% of k
+    t_star = -p.tau_g * math.log(max(1e-9, (p.k - 1.0) * 0.01 / max(p.k - 1.0, 1e-9)))
+    t_plateau_start = int(max(0.0, math.ceil(t_star)))
+    t_plateau_end = t_plateau_start + int(max(0, p.plateau_steps))
+    if t < t_plateau_start:
+        return s_grow
+    if t <= t_plateau_end:
+        return p.k
+    # decay
+    td = max(p.tau_d, 1e-9)
+    return 1.0 + (p.k - 1.0) * math.exp(-(t - t_plateau_end) / td)
+
 def run_simulation(
     params: SimParams,
     *,
@@ -222,7 +252,9 @@ def run_simulation(
         if stop_check is not None and stop_check():
             break
 
-        T, parcels, diag = step_once_persistent(T, parcels, params, rng)
+        # compute source temp for this step
+        T_source = source_multiplier(t, params) * params.T_a
+        T, parcels, diag = step_once_persistent(T, parcels, params, rng, T_source)
         if t % params.snapshot_stride == 0 or t == params.steps:
             snapshots.append((t, T.copy()))
         for k, v in diag.items():
@@ -240,6 +272,7 @@ def run_simulation(
                 im = ax_live.imshow(T / params.T_a, origin="lower", interpolation="nearest")
                 ax_live.set_title(f"Live field at t = {t}")
                 live_placeholder.pyplot(fig_live, clear_figure=True)
+                plt.close(fig_live)
             except Exception:
                 pass
 
@@ -251,13 +284,23 @@ def run_simulation(
 # -----------------------------
 
 st.title("Probabilistic buoyant plume: minimal model")
-st.caption("Batched, non-persistent parcels; read t then write t+1")
+st.caption("Persistent parcels with scheduled source and live controls")
 
 with st.sidebar:
     st.header("Controls")
     N = st.number_input("Grid size N", min_value=21, max_value=401, value=99, step=2, help="Prefer odd so the centre is unique")
     T_a = st.number_input("Ambient temperature T_a", min_value=0.1, value=20.0)
-    k = st.number_input("Source multiplier k", min_value=1.0, value=5.0)
+    k = st.number_input("Source peak multiplier k", min_value=1.0, value=5.0)
+
+    source_mode = st.selectbox("Source profile", ["Persistent", "Grow", "Grow-plateau-decay"], index=0, help="Schedule for source temperature at the centre")
+    col_s1, col_s2, col_s3 = st.columns(3)
+    with col_s1:
+        tau_g = st.number_input("Growth tau (steps)", min_value=1.0, value=20.0)
+    with col_s2:
+        plateau_steps = st.number_input("Plateau steps", min_value=0, value=50)
+    with col_s3:
+        tau_d = st.number_input("Decay tau (steps)", min_value=1.0, value=40.0)
+
     alpha = st.slider("Mixing fraction alpha", min_value=0.0, max_value=1.0, value=0.5)
     steps = st.number_input("Time steps", min_value=1, value=200)
     parcels_per_step = st.number_input("Parcels per step r", min_value=1, value=10)
@@ -287,7 +330,8 @@ if run_btn:
     params = SimParams(
         N=int(N), T_a=float(T_a), k=float(k), alpha=float(alpha),
         steps=int(steps), parcels_per_step=int(parcels_per_step),
-        seed=int(seed), snapshot_stride=int(snapshot_stride)
+        seed=int(seed), snapshot_stride=int(snapshot_stride),
+        source_mode=str(source_mode), tau_g=float(tau_g), plateau_steps=int(plateau_steps), tau_d=float(tau_d)
     )
     st.session_state.params = params
 
@@ -346,10 +390,11 @@ else:
         plt.colorbar(im, ax=ax1, fraction=0.046, pad=0.04, label="T/T_a")
         with col1:
             st.pyplot(fig1, clear_figure=True)
+        plt.close(fig1)
 
         # Centreline profile above the source
         c = res.params.N // 2
-        profile = T_last[c:, c] / res.params.T_a  # from centre upward
+        profile = T_sel[c:, c] / res.params.T_a  # from centre upward
         y = np.arange(profile.size)
         fig2, ax2 = plt.subplots(figsize=(6, 4))
         ax2.plot(profile, y)
@@ -358,6 +403,7 @@ else:
         ax2.set_title("Centreline profile above source")
         with col2:
             st.pyplot(fig2, clear_figure=True)
+        plt.close(fig2)
 
         # Diagnostics time series
         fig3, ax3 = plt.subplots(figsize=(6, 3))
@@ -370,6 +416,7 @@ else:
         ax3.legend()
         with col2:
             st.pyplot(fig3, clear_figure=True)
+        plt.close(fig3)
 
 # -----------------------------
 # Export area
@@ -398,6 +445,6 @@ if res is not None:
 st.markdown(
     """
     ---
-    Notes: non-persistent parcels with batched mixing. Later we will add the Brownian floor and directional persistence as optional features.
+    Notes: persistent parcels with scheduled source options (persistent, grow, grow–plateau–decay). Later we will add the Brownian floor and directional persistence as optional features.
     """
 )
