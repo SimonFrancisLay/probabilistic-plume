@@ -460,7 +460,7 @@ if run_btn:
         seed=int(seed), snapshot_stride=int(snapshot_stride),
         source_mode=str(source_mode), tau_g=float(tau_g), plateau_steps=int(plateau_steps), tau_d=float(tau_d),
         allow_diagonals=bool(allow_diagonals), epsilon_baseline=float(epsilon_baseline),
-        lambda_per_Ta=float(lambda_per_Ta), distance_penalty=bool(distance_penalty)
+        lambda_per_Ta=float(lambda_per_Ta), distance_penalty=bool(distance_penalty),
         boundary_mode=str(boundary_mode),
     )
     st.session_state.params = params
