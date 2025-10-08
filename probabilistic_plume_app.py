@@ -342,11 +342,11 @@ st.caption("Persistent parcels with scheduled source and exponential-ΔT movemen
 
 with st.sidebar:
     st.header("Controls")
-    N = st.number_input("Grid size N", min_value=21, max_value=401, value=99, step=2, help="Prefer odd so the centre is unique")
+    N   = st.number_input("Grid size N", min_value=21, max_value=401, value=99, step=2)
     T_a = st.number_input("Ambient temperature T_a", min_value=0.1, value=20.0)
-    k = st.number_input("Source peak multiplier k", min_value=1.0, value=5.0)
+    k   = st.number_input("Source peak multiplier k", min_value=1.0, value=5.0)
 
-    source_mode = st.selectbox("Source profile", ["Persistent", "Grow", "Grow-plateau-decay"], index=0, help="Schedule for source temperature at the centre")
+    source_mode = st.selectbox("Source profile", ["Persistent", "Grow", "Grow-plateau-decay"], index=0)
     col_s1, col_s2, col_s3 = st.columns(3)
     with col_s1:
         tau_g = st.number_input("Growth tau (steps)", min_value=1.0, value=20.0)
@@ -355,43 +355,24 @@ with st.sidebar:
     with col_s3:
         tau_d = st.number_input("Decay tau (steps)", min_value=1.0, value=40.0)
 
-    alpha = st.slider("Mixing fraction alpha", min_value=0.0, max_value=1.0, value=0.5)
+    alpha = st.slider("Mixing fraction alpha", 0.0, 1.0, 0.5)
 
     st.subheader("Movement model")
-    allow_diagonals = st.checkbox("Allow diagonal moves", value=True)
-    epsilon_baseline = st.slider("Baseline ε (floor)", min_value=0.0, max_value=0.05, value=0.005, step=0.001,
-                                 help="Small floor so motion never stalls")
-    lambda_per_Ta = st.slider("ΔT sensitivity λ (per T_a)", min_value=0.0, max_value=3.0, value=1.4, step=0.05,
-                               help="Effective λ is λ/T_a; higher = stronger response to ΔT")
+    allow_diagonals  = st.checkbox("Allow diagonal moves", value=True)
+    epsilon_baseline = st.slider("Baseline ε (floor)", 0.0, 0.05, 0.005, step=0.001)
+    lambda_per_Ta    = st.slider("ΔT sensitivity λ (per T_a)", 0.0, 3.0, 1.4, step=0.05)
     distance_penalty = st.checkbox("Distance penalty for diagonals (1/√2)", value=True)
 
-    steps = st.number_input("Time steps", min_value=1, value=200)
+    steps            = st.number_input("Time steps", min_value=1, value=200)
     parcels_per_step = st.number_input("Parcels per step r", min_value=1, value=10)
-    seed = st.number_input("Random seed", min_value=0, value=42)
-    snapshot_stride = st.number_input("Snapshot stride", min_value=1, value=10)
+    seed             = st.number_input("Random seed", min_value=0, value=42)
+    snapshot_stride  = st.number_input("Snapshot stride", min_value=1, value=10)
 
     st.markdown("---")
-    live_update_stride = st.number_input(
-        "Live update every n steps",
-        min_value=0,
-        value=10,
-        help="0 disables live plotting during a run"
-    )
+    live_update_stride = st.number_input("Live update every n steps", min_value=0, value=10)
     stop_btn = st.button("Stop", on_click=request_stop)
-    run_btn = st.button("Run simulation", type="primary") 
-    seed = st.number_input("Random seed", min_value=0, value=42)
-    snapshot_stride = st.number_input("Snapshot stride", min_value=1, value=10)
-
-    st.markdown("---")
-    live_update_stride = st.number_input(
-        "Live update every n steps",
-        min_value=0,
-        value=10,
-        help="0 disables live plotting during a run"
-    )
-    stop_btn = st.button("Stop", on_click=request_stop)
-    run_btn = st.button("Run simulation", type="primary")
-
+    run_btn  = st.button("Run simulation", type="primary")
+    
 # Store params in session state for reproducibility and reruns
 if "params" not in st.session_state:
     st.session_state.params = None
