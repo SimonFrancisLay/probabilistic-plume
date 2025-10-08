@@ -590,7 +590,7 @@ with st.sidebar:
         min_value=0.0, max_value=0.2, value=0.02, step=0.005,
         help="Moore-neighbour mixing per step. Set to 0 to disable."
     )
-    
+
     steps            = st.number_input("Time steps", min_value=1, value=200)
     parcels_per_step = st.number_input("Parcels per step r", min_value=1, value=10)
     seed             = st.number_input("Random seed", min_value=0, value=42)
@@ -622,7 +622,7 @@ if run_btn:
         epsilon_diffusion=float(epsilon_diffusion),
         barrier_enabled=bool(barrier_enabled), barrier_y0=int(barrier_y0), barrier_x0=int(barrier_x0), barrier_y1=int(barrier_y1), barrier_x1=int(barrier_x1),
     )
-    )
+    
     st.session_state.params = params
 
     # Progress UI
