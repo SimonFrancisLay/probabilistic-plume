@@ -60,8 +60,11 @@ class SimParams:
     tau_g: float = 20.0  # growth time constant (steps)
     plateau_steps: int = 50  # plateau duration (steps)
     tau_d: float = 40.0  # decay time constant (steps)
-    # Background diffusion (global neighbour mixing each step)
-    epsilon_diffusion: float = 0.0  # 0 disables; applied over 8 neighbours (Moore)
+    # Movement model parameters (exponential ΔT weighting)
+    allow_diagonals: bool = True
+    epsilon_baseline: float = 0.005  # small floor to avoid stalling
+    lambda_per_Ta: float = 1.4       # λ is interpreted per T_a: λ_eff = lambda_per_Ta / T_a
+    distance_penalty: bool = True
     # Source scheduling
     source_mode: str = "Persistent"  # options: Persistent, Grow, Grow-plateau-decay
     tau_g: float = 20.0  # growth time constant (steps)
@@ -87,7 +90,7 @@ def request_stop():
     st.session_state.stop_requested = True
 
 # -----------------------------
-# Core model helpers (persistent engine)
+# Core model helpers (persistent engine, exponential ΔT movement)
 # -----------------------------
 
 def init_grid(params: SimParams) -> np.ndarray:
@@ -110,15 +113,45 @@ def neighbor_map(i: int, j: int, N: int) -> Dict[str, Optional[Tuple[int, int]]]
     }
 
 
-def choose_move_weights(T_particle: float, T_neighbors: Dict[str, float], T_a: float) -> Dict[str, float]:
-    """Return unnormalised move weights for up, left, right, down based on the basic rule.
-    Cooler neighbors only. Up gets bias b = T_particle / T_a. Others get weight 1.
+def compute_move_weights_exp(T_particle: float, T_neighbors: Dict[str, float], params: SimParams) -> Dict[str, float]:
+    """Exponential ΔT weighting with directional priors and optional distance penalty.
+    w_d = [ε + max(exp(λ ΔT) - 1, 0)] * P_dir(d) * C_dist(d),  ΔT = T_p - T_n
+    Direction priors favour up, then up-diagonals, then lateral, then down.
     """
-    b = T_particle / T_a
-    weights: Dict[str, float] = {"up": 0.0, "left": 0.0, "right": 0.0, "down": 0.0}
+    eps = max(0.0, params.epsilon_baseline)
+    lam_eff = params.lambda_per_Ta / max(params.T_a, 1e-12)
+
+    b = T_particle / params.T_a  # buoyancy factor for priors
+    P_dir = {
+        "up": b,
+        "up_left": 0.7 * b,
+        "up_right": 0.7 * b,
+        "left": 0.5,
+        "right": 0.5,
+        "down": 0.3,
+        "down_left": 0.2,
+        "down_right": 0.2,
+    }
+    C_dist = {
+        "up": 1.0, "down": 1.0, "left": 1.0, "right": 1.0,
+        "up_left": (1.0 / np.sqrt(2)) if params.distance_penalty else 1.0,
+        "up_right": (1.0 / np.sqrt(2)) if params.distance_penalty else 1.0,
+        "down_left": (1.0 / np.sqrt(2)) if params.distance_penalty else 1.0,
+        "down_right": (1.0 / np.sqrt(2)) if params.distance_penalty else 1.0,
+    }
+
+    weights: Dict[str, float] = {}
     for d, Tn in T_neighbors.items():
-        if Tn < T_particle:
-            weights[d] = b if d == "up" else 1.0
+        # Only include priors we defined; skip unknown keys
+        if d not in P_dir:
+            continue
+        dT = T_particle - Tn
+        g = np.exp(lam_eff * dT) - 1.0 if dT > 0 else 0.0
+        w = (eps + g) * P_dir[d] * C_dist.get(d, 1.0)
+        weights[d] = max(0.0, float(w))
+
+    # Add a small 'stay' option so we never run out of probability mass
+    weights["stay"] = eps
     return weights
 
 # Persistent parcel representation
@@ -147,24 +180,26 @@ def step_once_persistent(T: np.ndarray, parcels: List[Parcel], params: SimParams
 
     new_parcels: List[Parcel] = []
     for p in parcels:
-        nbrs = neighbor_map(p.i, p.j, N)
+        nbrs = neighbor_map(p.i, p.j, N, allow_diagonals=params.allow_diagonals)
         T_neighbors: Dict[str, float] = {d: T[idx] for d, idx in nbrs.items() if idx is not None}
-        weights = choose_move_weights(p.T, T_neighbors, params.T_a)
-        total_w = sum(weights.values())
-
-        if total_w <= 0.0:
+        weights = compute_move_weights_exp(p.T, T_neighbors, params)
+        dirs = list(weights.keys())
+        probs = np.array([weights[d] for d in dirs], dtype=np.float64)
+        s = probs.sum()
+        if s <= 0:
             di, dj = p.i, p.j
-            chosen_dir = None
+            chosen_dir = "stay"
         else:
-            dirs = list(weights.keys())
-            probs = np.array([weights[d] for d in dirs], dtype=np.float64)
-            probs /= probs.sum()
+            probs /= s
             choice = rng.choice(len(dirs), p=probs)
             chosen_dir = dirs[choice]
-            di, dj = neighbor_map(p.i, p.j, N)[chosen_dir]
-            total_moves += 1
-            if chosen_dir == "up":
-                moved_up += 1
+            if chosen_dir == "stay":
+                di, dj = p.i, p.j
+            else:
+                di, dj = nbrs[chosen_dir]
+                total_moves += 1
+                if chosen_dir.startswith("up"):
+                    moved_up += 1
 
         arrivals_T[di][dj].append(p.T)
         new_parcels.append(Parcel(di, dj, p.T))
@@ -277,8 +312,7 @@ def run_simulation(
         # compute source temp for this step
         T_source = source_multiplier(t, params) * params.T_a
         T, parcels, diag = step_once_persistent(T, parcels, params, rng, T_source)
-        # Background diffusion over 8 neighbours
-        T = diffuse8(T, params.epsilon_diffusion)
+        
         if t % params.snapshot_stride == 0 or t == params.steps:
             snapshots.append((t, T.copy()))
         for k, v in diag.items():
@@ -309,7 +343,7 @@ def run_simulation(
 # -----------------------------
 
 st.title("Probabilistic buoyant plume: minimal model")
-st.caption("Persistent parcels with scheduled source and live controls")
+st.caption("Persistent parcels with scheduled source and exponential-ΔT movement; no background diffusion")
 
 with st.sidebar:
     st.header("Controls")
@@ -327,10 +361,29 @@ with st.sidebar:
         tau_d = st.number_input("Decay tau (steps)", min_value=1.0, value=40.0)
 
     alpha = st.slider("Mixing fraction alpha", min_value=0.0, max_value=1.0, value=0.5)
-    epsilon_diffusion = st.slider("Background diffusion ε (8-neighbour)", min_value=0.0, max_value=0.2, value=0.0, step=0.005,
-                                  help="Each step, blend a fraction ε of each cell with the average of its 8 neighbours")
+
+    st.subheader("Movement model")
+    allow_diagonals = st.checkbox("Allow diagonal moves", value=True)
+    epsilon_baseline = st.slider("Baseline ε (floor)", min_value=0.0, max_value=0.05, value=0.005, step=0.001,
+                                 help="Small floor so motion never stalls")
+    lambda_per_Ta = st.slider("ΔT sensitivity λ (per T_a)", min_value=0.0, max_value=3.0, value=1.4, step=0.05,
+                               help="Effective λ is λ/T_a; higher = stronger response to ΔT")
+    distance_penalty = st.checkbox("Distance penalty for diagonals (1/√2)", value=True)
 
     steps = st.number_input("Time steps", min_value=1, value=200)
+    parcels_per_step = st.number_input("Parcels per step r", min_value=1, value=10)
+    seed = st.number_input("Random seed", min_value=0, value=42)
+    snapshot_stride = st.number_input("Snapshot stride", min_value=1, value=10)
+
+    st.markdown("---")
+    live_update_stride = st.number_input(
+        "Live update every n steps",
+        min_value=0,
+        value=10,
+        help="0 disables live plotting during a run"
+    )
+    stop_btn = st.button("Stop", on_click=request_stop)
+    run_btn = st.button("Run simulation", type="primary") st.number_input("Time steps", min_value=1, value=200)
     parcels_per_step = st.number_input("Parcels per step r", min_value=1, value=10)
     seed = st.number_input("Random seed", min_value=0, value=42)
     snapshot_stride = st.number_input("Snapshot stride", min_value=1, value=10)
@@ -360,7 +413,8 @@ if run_btn:
         steps=int(steps), parcels_per_step=int(parcels_per_step),
         seed=int(seed), snapshot_stride=int(snapshot_stride),
         source_mode=str(source_mode), tau_g=float(tau_g), plateau_steps=int(plateau_steps), tau_d=float(tau_d),
-        epsilon_diffusion=float(epsilon_diffusion)
+        allow_diagonals=bool(allow_diagonals), epsilon_baseline=float(epsilon_baseline),
+        lambda_per_Ta=float(lambda_per_Ta), distance_penalty=bool(distance_penalty)
     )
     st.session_state.params = params
 
@@ -477,6 +531,6 @@ if res is not None:
 st.markdown(
     """
     ---
-    Notes: persistent parcels with scheduled source options (persistent, grow, grow–plateau–decay) and optional 8‑neighbour background diffusion ε. Later we will add the Brownian floor and directional persistence as optional features.
+    Notes: persistent parcels with scheduled source options (persistent, grow, grow–plateau–decay) and exponential-ΔT movement with optional diagonals; no global diffusion. Later we will add the Brownian floor and directional persistence as optional features.
     """
 )
