@@ -109,21 +109,22 @@ def source_multiplier(t: int, p: SimParams) -> float:
     return 1.0 + (p.k - 1.0) * np.exp(-(t - t_plateau_end) / max(p.tau_d, 1e-9))
 
 
+
+# NEW:
 def source_region_coords(N: int, frac: float) -> Tuple[int, int, int, int]:
-    """Return (y0, y1, x0, x1) for a centered square whose area ~ frac * N*N.
-    Ensures at least 1×1 and uses odd side for symmetry about centre.
+    """
+    Return (y0, y1, x0, x1) for a centered HORIZONTAL STRIP one-cell tall,
+    with length ≈ frac * N. Ensures at least 1 cell, clamps to grid,
+    and uses an odd length so the strip is symmetric about the centre.
     """
     frac = float(np.clip(frac, 0.0, 1.0))
-    if frac <= 0.0:
-        c = N // 2
-        return c, c, c, c
-    side = max(1, int(round(np.sqrt(frac) * N)))
-    if side % 2 == 0:
-        side = min(side + 1, N)
-    c = N // 2
-    half = side // 2
-    y0 = max(0, c - half)
-    y1 = min(N - 1, c + half)
+    c = N // 2  # centre row and col
+    # desired span in columns
+    span = max(1, int(round(frac * N)))
+    if span % 2 == 0:
+        span = min(span + 1, N)  # keep odd so it centers on c
+    half = span // 2
+    y0 = y1 = c                  # one cell deep in the vertical
     x0 = max(0, c - half)
     x1 = min(N - 1, c + half)
     return y0, y1, x0, x1
@@ -498,7 +499,7 @@ with st.sidebar:
         tau_d = st.number_input("Decay tau (steps)", min_value=1.0, value=40.0)
 
     source_area_pct = st.slider(
-        "Source area (% of grid cells)",
+        "Source area (% of grid width)",
         min_value=0.5, max_value=25.0, value=5.0, step=0.5,
         help="The source is a centered square covering this percent of total cells",
     )
