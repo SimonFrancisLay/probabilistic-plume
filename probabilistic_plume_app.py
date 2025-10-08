@@ -500,7 +500,7 @@ with st.sidebar:
     barrier_y0 = st.number_input("Barrier bottom row i0 (0=bottom)", min_value=0, max_value=int(N-1), value=int(st.session_state.barrier_y0))
     barrier_y1 = st.number_input("Barrier top row i1",                 min_value=0, max_value=int(N-1), value=int(st.session_state.barrier_y1))
     barrier_x0 = st.number_input("Barrier left col j0",                min_value=0, max_value=int(N-1), value=int(st.session_state.barrier_x0))
-    barrier_x1 = st.number_input("Barrier right col j1",               min_value=0, max_value=int(N-1), value=int(st.session_state.barrier_x1)), value=int(N-20))
+    barrier_x1 = st.number_input("Barrier right col j1",               min_value=0, max_value=int(N-1), value=int(st.session_state.barrier_x1))
 
     st.subheader("Color mapping")
     cmap_name = st.selectbox("Colormap", ["inferno", "magma", "viridis", "plasma", "cividis"], index=0, help="Perceptually uniform maps give smooth gradation")
