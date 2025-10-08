@@ -54,7 +54,7 @@ class SimParams:
     N: int = 99
     T_a: float = 20.0
     k: float = 5.0            # peak or source multiplier
-    alpha: float = 0.5        # mixing fraction on arrival
+    alpha: float = 0.5        # mixing fraction on arrival, only used if optional smoothing is enabled later
     steps: int = 200
     parcels_per_step: int = 10
     seed: int = 42
@@ -70,8 +70,10 @@ class SimParams:
     lambda_per_Ta: float = 1.4       # effective lambda is lambda_per_Ta / T_a
     distance_penalty: bool = True    # multiply diagonal weights by 1/sqrt(2)
     disable_gravity: bool = False    # if True, remove directional buoyancy bias
+    # Flux engine control
+    beta_transfer: float = 0.3       # fraction of export per step
     # Background diffusion
-    epsilon_diffusion: float = 0.02  # per-step Moore-neighbour mixing; 0 disables
+    epsilon_diffusion: float = 0.02  # per step Moore neighbour mixing
     # Boundary handling
     boundary_mode: str = "Outflow"   # options: Outflow, Blocked, Periodic
     # Adiabatic barrier block
@@ -79,7 +81,7 @@ class SimParams:
     barrier_y0: int = 50   # bottom row i, inclusive 0..N-1, origin lower so larger is higher
     barrier_x0: int = 20   # left col j, inclusive
     barrier_y1: int = 70   # top row i, inclusive
-    barrier_x1: int = 80   # right col j, inclusive
+    barrier_x1: int = 80   # right col j, inclusive   # right col j, inclusive
 
 
 
@@ -101,7 +103,7 @@ def request_stop():
     st.session_state.stop_requested = True
 
 # -----------------------------
-# Core model helpers, persistent engine with exponential dT movement
+# Core model helpers, flux engine with exponential dT movement
 # -----------------------------
 
 def init_grid(params: SimParams) -> np.ndarray:
@@ -141,149 +143,67 @@ def neighbor_map(
         if 0 <= ii < N and 0 <= jj < N:
             nbrs[d] = (ii, jj)
         else:
-            # Blocked and Outflow both mark as None here. Outflow is handled in the step logic.
             nbrs[d] = None
     return nbrs
 
 
-def compute_move_weights_exp(T_particle: float, T_neighbors: Dict[str, float], params: SimParams) -> Dict[str, float]:
-    """Exponential dT weighting with directional priors and optional distance penalty.
-    w_d = [eps + max(exp(lambda * dT) - 1, 0)] * P_dir(d) * C_dist(d),  dT = T_p - T_n
-    Direction priors favour up, then up diagonals, then lateral, then down. Can be disabled with disable_gravity.
-    """
-    eps = max(0.0, params.epsilon_baseline)
-    lam_eff = params.lambda_per_Ta / max(params.T_a, 1e-12)
-
+def _direction_priors(T_particle: float, params: SimParams) -> Dict[str, float]:
     if params.disable_gravity:
         base = 1.0
-        P_dir = {
+        return {
             "up": base, "up_left": base, "up_right": base,
             "left": base, "right": base,
             "down": base, "down_left": base, "down_right": base,
         }
-    else:
-        b = T_particle / params.T_a  # buoyancy factor
-        P_dir = {
-            "up": b,
-            "up_left": 0.7 * b,
-            "up_right": 0.7 * b,
-            "left": 0.5,
-            "right": 0.5,
-            "down": 0.3,
-            "down_left": 0.2,
-            "down_right": 0.2,
-        }
-    C_dist = {
-        "up": 1.0, "down": 1.0, "left": 1.0, "right": 1.0,
-        "up_left": (1.0 / np.sqrt(2)) if params.distance_penalty else 1.0,
-        "up_right": (1.0 / np.sqrt(2)) if params.distance_penalty else 1.0,
-        "down_left": (1.0 / np.sqrt(2)) if params.distance_penalty else 1.0,
-        "down_right": (1.0 / np.sqrt(2)) if params.distance_penalty else 1.0,
+    b = T_particle / params.T_a
+    return {
+        "up": b,
+        "up_left": 0.7 * b,
+        "up_right": 0.7 * b,
+        "left": 0.5,
+        "right": 0.5,
+        "down": 0.3,
+        "down_left": 0.2,
+        "down_right": 0.2,
     }
 
-    weights: Dict[str, float] = {}
+
+def _distance_penalty(params: SimParams) -> Dict[str, float]:
+    diag = (1.0 / np.sqrt(2)) if params.distance_penalty else 1.0
+    return {
+        "up": 1.0, "down": 1.0, "left": 1.0, "right": 1.0,
+        "up_left": diag, "up_right": diag, "down_left": diag, "down_right": diag,
+    }
+
+
+def compute_flux_weights(
+    T_particle: float,
+    T_neighbors: Dict[str, float],
+    *,
+    params: SimParams,
+) -> Dict[str, float]:
+    """Weights for directional flux out of a cell, no 'stay' entry here.
+    Uses exponential dT, directional priors, and distance penalties.
+    """
+    eps = max(0.0, params.epsilon_baseline)
+    lam_eff = params.lambda_per_Ta / max(params.T_a, 1e-12)
+    P = _direction_priors(T_particle, params)
+    C = _distance_penalty(params)
+    w: Dict[str, float] = {}
     for d, Tn in T_neighbors.items():
-        if d not in P_dir:
+        if d not in P:
             continue
         dT = T_particle - Tn
         g = np.exp(lam_eff * dT) - 1.0 if dT > 0 else 0.0
-        w = (eps + g) * P_dir[d] * C_dist.get(d, 1.0)
-        weights[d] = max(0.0, float(w))
-
-    # Add a small stay option so we never run out of probability mass
-    weights["stay"] = eps
-    return weights
-
-
-@dataclass
-class Parcel:
-    i: int
-    j: int
-    T: float
-
-
-def source_multiplier(t: int, p: SimParams) -> float:
-    """Return source temperature multiplier s(t) so that T_source(t) = s(t) * T_a."""
-    import math
-    if p.source_mode == "Persistent":
-        return p.k
-    if p.source_mode == "Grow":
-        return 1.0 + (p.k - 1.0) * (1.0 - math.exp(-max(t, 0) / max(p.tau_g, 1e-9)))
-    # Grow, plateau, decay
-    s_grow = 1.0 + (p.k - 1.0) * (1.0 - math.exp(-max(t, 0) / max(p.tau_g, 1e-9)))
-    if p.k <= 1.0:
-        t_plateau_start = 0
-    else:
-        t_star = -p.tau_g * math.log(max(1e-9, (p.k - 1.0) * 0.01 / max(p.k - 1.0, 1e-9)))
-        t_plateau_start = int(max(0.0, math.ceil(t_star)))
-    t_plateau_end = t_plateau_start + int(max(0, p.plateau_steps))
-    if t < t_plateau_start:
-        return s_grow
-    if t <= t_plateau_end:
-        return p.k
-    td = max(p.tau_d, 1e-9)
-    return 1.0 + (p.k - 1.0) * math.exp(-(t - t_plateau_end) / td)
-
-
-def build_barrier_mask(N: int, p: SimParams) -> Optional[np.ndarray]:
-    """Return a boolean mask of shape (N, N) where True marks adiabatic barrier cells.
-    Rectangle from (y0, x0) to (y1, x1) inclusive. If disabled or empty, return None.
-    """
-    if not p.barrier_enabled:
-        return None
-
-    y0 = int(np.clip(min(p.barrier_y0, p.barrier_y1), 0, N-1))
-    y1 = int(np.clip(max(p.barrier_y0, p.barrier_y1), 0, N-1))
-    x0 = int(np.clip(min(p.barrier_x0, p.barrier_x1), 0, N-1))
-    x1 = int(np.clip(max(p.barrier_x0, p.barrier_x1), 0, N-1))
-
-    if y1 < y0 or x1 < x0:
-        return None
-
-    mask = np.zeros((N, N), dtype=bool)
-    mask[y0:y1+1, x0:x1+1] = True
-    return mask
-
-
-def compute_default_barrier(N: int) -> Tuple[int, int, int, int]:
-    """Default rectangular barrier based on N.
-    Vertically: centred halfway between centre and top, thickness = 5 percent of N (at least 1).
-    Horizontally: spans from 1/4 to 2/3 of the width.
-    Returns (y0, y1, x0, x1), clamped to grid.
-    """
-    if N <= 0:
-        return 0, 0, 0, 0
-    centre = N // 2
-    top = N - 1
-    centre_to_top_mid = int(round((centre + top) / 2))
-    thickness = max(1, int(round(0.05 * N)))
-    y0 = centre_to_top_mid - thickness // 2
-    y1 = y0 + thickness - 1
-    y0 = max(0, min(N - 1, y0))
-    y1 = max(0, min(N - 1, y1))
-    if y1 < y0:
-        y1 = y0
-    x0 = int(round(0.25 * (N - 1)))
-    x1 = int(round((2.0 / 3.0) * (N - 1)))
-    x0 = max(0, min(N - 1, x0))
-    x1 = max(0, min(N - 1, x1))
-    if x1 < x0:
-        x1 = x0
-    return y0, y1, x0, x1
+        w[d] = max(0.0, float((eps + g) * P[d] * C.get(d, 1.0)))
+    return w
 
 
 def background_diffuse(T: np.ndarray, params: SimParams, barrier_mask: Optional[np.ndarray]) -> np.ndarray:
-    """Apply simple background diffusion with Moore neighbours.
-    Uses Neumann-like edges for Outflow/Blocked via edge padding; Periodic wraps.
-    Does not allow heat into barrier cells; they are reset to T_a after diffusion.
-    """
     eps = max(0.0, float(params.epsilon_diffusion))
     if eps <= 0.0:
         return T
-    N = params.N
-
     if params.boundary_mode == "Periodic":
-        # 8-neighbour mean via rolls
         up = np.roll(T, -1, axis=0)
         down = np.roll(T, 1, axis=0)
         left = np.roll(T, 1, axis=1)
@@ -294,7 +214,6 @@ def background_diffuse(T: np.ndarray, params: SimParams, barrier_mask: Optional[
         dr = np.roll(down, -1, axis=1)
         neigh_mean = (up + down + left + right + ul + ur + dl + dr) / 8.0
     else:
-        # Edge padded to emulate zero-flux boundaries
         Tp = np.pad(T, ((1, 1), (1, 1)), mode='edge')
         c = Tp[1:-1, 1:-1]
         up = Tp[2:, 1:-1]
@@ -306,156 +225,80 @@ def background_diffuse(T: np.ndarray, params: SimParams, barrier_mask: Optional[
         dl = Tp[:-2, :-2]
         dr = Tp[:-2, 2:]
         neigh_mean = (up + down + left + right + ul + ur + dl + dr) / 8.0
-
     T_new = (1.0 - eps) * T + eps * neigh_mean
-
     if barrier_mask is not None:
-        # enforce adiabatic cells remain at ambient
         T_new[barrier_mask] = params.T_a
     return T_new
 
 
-
-def compute_default_barrier(N: int) -> Tuple[int, int, int, int]:
-    """Default rectangular barrier based on N.
-    Vertically: centred halfway between centre and top, thickness = 5 percent of N (at least 1).
-    Horizontally: spans from 1/4 to 2/3 of the width.
-    Returns (y0, y1, x0, x1), clamped to grid.
-    """
-    if N <= 0:
-        return 0, 0, 0, 0
-    # Vertical placement
-    centre = N // 2
-    top = N - 1
-    centre_to_top_mid = int(round((centre + top) / 2))
-    thickness = max(1, int(round(0.05 * N)))
-    y0 = centre_to_top_mid - thickness // 2
-    y1 = y0 + thickness - 1
-    y0 = max(0, min(N - 1, y0))
-    y1 = max(0, min(N - 1, y1))
-    if y1 < y0:
-        y1 = y0
-    # Horizontal span
-    x0 = int(round(0.25 * (N - 1)))
-    x1 = int(round((2.0 / 3.0) * (N - 1)))
-    x0 = max(0, min(N - 1, x0))
-    x1 = max(0, min(N - 1, x1))
-    if x1 < x0:
-        x1 = x0
-    return y0, y1, x0, x1
-
-
-def step_once_persistent(
+def flux_step(
     T: np.ndarray,
-    parcels: List[Parcel],
+    *,
     params: SimParams,
-    rng: np.random.Generator,
-    T_source: float,
-    barrier_mask: Optional[np.ndarray] = None,
-) -> Tuple[np.ndarray, List[Parcel], Dict[str, float]]:
+    barrier_mask: Optional[np.ndarray],
+) -> Tuple[np.ndarray, Dict[str, float]]:
+    """One synchronous conservative flux update with optional outflow loss."""
     N = params.N
-    c = N // 2
+    export_excess = True  # export only above ambient
+    beta = float(getattr(params, 'beta_transfer', 0.3))
 
-    # Clamp source cell and inject r new parcels only if source is hotter than ambient
-    if barrier_mask is not None and barrier_mask[c, c]:
-        st.warning("Barrier overlaps the source cell; source cell will be exempt from the barrier.")
-        barrier_mask = barrier_mask.copy()
-        barrier_mask[c, c] = False
-    if T_source > params.T_a + 1e-6:
-        T[c, c] = T_source
-        for _ in range(params.parcels_per_step):
-            parcels.append(Parcel(c, c, T_source))
+    outflow = np.zeros_like(T)
+    inflow = np.zeros_like(T)
+    sink_loss = 0.0
 
-    # Arrival buckets per destination cell
-    arrivals_T: List[List[List[float]]] = [[[] for _ in range(N)] for __ in range(N)]
-
-    moved_up = 0
-    total_moves = 0
-
-    new_parcels: List[Parcel] = []
-    for p in parcels:
-        nbrs = neighbor_map(
-            p.i, p.j, N,
-            allow_diagonals=params.allow_diagonals,
-            boundary_mode=params.boundary_mode,
-        )
-        # Build temperature map from in-bounds neighbours, skipping barrier cells
-        T_neighbors: Dict[str, float] = {}
-        for d, idx in nbrs.items():
-            if idx is None:
+    for i in range(N):
+        for j in range(N):
+            if barrier_mask is not None and barrier_mask[i, j]:
                 continue
-            ii, jj = idx
-            if barrier_mask is not None and barrier_mask[ii, jj]:
+            Tij = T[i, j]
+            # Amount available to export
+            Xij = max(Tij - params.T_a, 0.0) if export_excess else Tij
+            export = beta * Xij
+            if export <= 0.0:
                 continue
-            T_neighbors[d] = T[ii, jj]
-        # For Outflow, create synthetic neighbours for off-grid directions using ambient
-        if params.boundary_mode == "Outflow":
+
+            nbrs = neighbor_map(i, j, N, allow_diagonals=params.allow_diagonals, boundary_mode=params.boundary_mode)
+            Tn: Dict[str, float] = {}
+            sink_dirs: List[str] = []
             for d, idx in nbrs.items():
                 if idx is None:
-                    T_neighbors[d] = params.T_a
+                    if params.boundary_mode == "Outflow":
+                        # Represent sink directions by using ambient for their Tn in the weight calculation
+                        Tn[d] = params.T_a
+                        sink_dirs.append(d)
+                    # Blocked ignores off grid
+                    continue
+                ii, jj = idx
+                if barrier_mask is not None and barrier_mask[ii, jj]:
+                    continue
+                Tn[d] = T[ii, jj]
 
-        weights = compute_move_weights_exp(p.T, T_neighbors, params)
-        dirs = list(weights.keys())
-        probs = np.array([weights[d] for d in dirs], dtype=np.float64)
-        s = probs.sum()
-        if s <= 0:
-            chosen_dir = "stay"
-        else:
-            probs /= s
-            choice = rng.choice(len(dirs), p=probs)
-            chosen_dir = dirs[choice]
-
-        if chosen_dir == "stay":
-            di, dj = p.i, p.j
-            arrivals_T[di][dj].append(p.T)
-            new_parcels.append(Parcel(di, dj, p.T))
-            continue
-
-        dest = nbrs.get(chosen_dir, None)
-        # If destination is a barrier cell, treat as blocked
-        if dest is not None and barrier_mask is not None and barrier_mask[dest[0], dest[1]]:
-            dest = None
-
-        if dest is None:
-            if params.boundary_mode == "Outflow":
-                # Parcel leaves the domain
-                total_moves += 1
+            if not Tn:
                 continue
-            else:
-                # Blocked: treat as stay
-                di, dj = p.i, p.j
-        else:
-            di, dj = dest
-            total_moves += 1
-            if str(chosen_dir).startswith("up"):
-                moved_up += 1
 
-        arrivals_T[di][dj].append(p.T)
-        new_parcels.append(Parcel(di, dj, p.T))
-
-    # Mix arrivals to produce T_next and update parcel temperatures
-    T_next = T.copy()
-    for di in range(N):
-        for dj in range(N):
-            if barrier_mask is not None and barrier_mask[di, dj]:
-                # adiabatic barrier holds ambient and ignores arrivals
-                T_next[di, dj] = params.T_a
+            w = compute_flux_weights(Tij, Tn, params=params)
+            total_w = sum(w.values())
+            if total_w <= 0.0:
                 continue
-            if arrivals_T[di][dj]:
-                T_cell = T_next[di][dj]
-                for Tin in arrivals_T[di][dj]:
-                    T_cell = (1.0 - params.alpha) * T_cell + params.alpha * Tin
-                T_next[di][dj] = T_cell
 
-    # Apply global background diffusion
+            # Distribute export
+            for d, wd in w.items():
+                frac = wd / total_w
+                if d in sink_dirs:
+                    sink_loss += export * frac
+                else:
+                    ii, jj = nbrs[d]
+                    inflow[ii, jj] += export * frac
+            outflow[i, j] += export
+
+    T_next = T - outflow + inflow
+
+    # Enforce barrier ambient
+    if barrier_mask is not None:
+        T_next[barrier_mask] = params.T_a
+
+    # Background diffusion
     T_next = background_diffuse(T_next, params, barrier_mask)
-
-    # Update parcels to mixed destination cell temperature
-    final_parcels: List[Parcel] = []
-    for p in new_parcels:
-        p.T = T_next[p.i, p.j]
-        final_parcels.append(p)
-
 
     # Diagnostics
     diag: Dict[str, float] = {}
@@ -464,12 +307,9 @@ def step_once_persistent(
     y = np.arange(N, dtype=np.float64)
     weighted_sum = (T_next * y[:, None]).sum()
     total_temp = T_next.sum()
-    diag["vertical_centroid"] = float(weighted_sum / total_temp) if total_temp > 0 else float(c)
-    frac_up = moved_up / total_moves if total_moves > 0 else 0.0
-    diag["frac_moves_up"] = float(frac_up)
-    diag["active_parcels"] = float(len(final_parcels))
-
-    return T_next, final_parcels, diag
+    diag["vertical_centroid"] = float(weighted_sum / total_temp) if total_temp > 0 else float(N // 2)
+    diag["sink_loss"] = float(sink_loss)
+    return T_next, diag
 
 
 def run_simulation(
@@ -482,7 +322,6 @@ def run_simulation(
 ) -> SimResults:
     rng = np.random.default_rng(params.seed)
     T = init_grid(params)
-    parcels: List[Parcel] = []
 
     # Build adiabatic barrier mask once per run
     barrier_mask = build_barrier_mask(params.N, params)
@@ -492,16 +331,23 @@ def run_simulation(
         "max_T_over_Ta": [(0, float(T.max() / params.T_a))],
         "mean_T_over_Ta": [(0, float(T.mean() / params.T_a))],
         "vertical_centroid": [(0, float((np.arange(params.N)[:, None] * T).sum() / T.sum()))],
-        "frac_moves_up": [(0, 0.0)],
-        "active_parcels": [(0, 0.0)],
+        "frac_moves_up": [(0, 0.0)],  # retained name for continuity
+        "active_parcels": [(0, 0.0)], # not used in flux mode
+        "sink_loss": [(0, 0.0)],
     }
+
+    c = params.N // 2
 
     for t in range(1, params.steps + 1):
         if stop_check is not None and stop_check():
             break
 
+        # Source forcing: only while hotter than ambient
         T_source = source_multiplier(t, params) * params.T_a
-        T, parcels, diag = step_once_persistent(T, parcels, params, rng, T_source, barrier_mask)
+        if T_source > params.T_a + 1e-6:
+            T[c, c] = T_source
+
+        T, diag = flux_step(T, params=params, barrier_mask=barrier_mask)
 
         if t % params.snapshot_stride == 0 or t == params.steps:
             snapshots.append((t, T.copy()))
@@ -522,6 +368,15 @@ def run_simulation(
                 pass
 
     return SimResults(T=T, snapshots=snapshots, diagnostics=diagnostics, params=params)
+
+# ---
+# Legacy parcel engine kept for reference, not used now
+#
+# def step_once_persistent(...):
+#     ... existing parcel code ...
+#
+# def run_simulation(...):
+#     ... parcel based integration ...
 
 # -----------------------------
 # UI controls
@@ -552,7 +407,10 @@ with st.sidebar:
     epsilon_baseline = st.slider("Baseline eps (floor)", 0.0, 0.05, 0.005, step=0.001, help="Small floor so motion never stalls")
     lambda_per_Ta    = st.slider("dT sensitivity lambda (per T_a)", 0.0, 3.0, 1.4, step=0.05, help="Effective lambda is lambda/T_a")
     distance_penalty = st.checkbox("Distance penalty for diagonals (1/sqrt(2))", value=True)
-    disable_gravity  = st.checkbox("Disable gravity bias", value=False, help="Treat all directions equally; only dT and distance penalty apply")
+    disable_gravity  = st.checkbox("Disable gravity bias", value=False, help="Treat all directions equally, only dT and distance penalty apply")
+
+    st.subheader("Flux transfer")
+    beta_transfer = st.slider("Export fraction per step β", 0.0, 0.8, 0.3, 0.05, help="Fraction of cell temperature above ambient exported each step")
 
     boundary_mode = st.selectbox("Boundary mode", ["Outflow", "Blocked", "Periodic"], index=0, help="Outflow removes parcels that step out; Blocked ignores off-grid moves; Periodic wraps around")
 
@@ -578,7 +436,7 @@ with st.sidebar:
     barrier_y0 = st.number_input("Barrier bottom row i0 (0=bottom)", min_value=0, max_value=int(N-1), value=int(st.session_state.barrier_y0))
     barrier_y1 = st.number_input("Barrier top row i1",                 min_value=0, max_value=int(N-1), value=int(st.session_state.barrier_y1))
     barrier_x0 = st.number_input("Barrier left col j0",                min_value=0, max_value=int(N-1), value=int(st.session_state.barrier_x0))
-    barrier_x1 = st.number_input("Barrier right col j1",               min_value=0, max_value=int(N-1), value=int(st.session_state.barrier_x1))
+    barrier_x1 = st.number_input("Barrier right col j1",               min_value=0, max_value=int(N-1), value=int(st.session_state.barrier_x1)), value=int(N-20))
 
     st.subheader("Color mapping")
     cmap_name = st.selectbox("Colormap", ["inferno", "magma", "viridis", "plasma", "cividis"], index=0, help="Perceptually uniform maps give smooth gradation")
@@ -589,7 +447,7 @@ with st.sidebar:
         "Background diffusion ε",
         min_value=0.0, max_value=0.2, value=0.02, step=0.005,
         help="Moore-neighbour mixing per step. Set to 0 to disable."
-    )
+    )", min_value=0.3, max_value=2.0, value=1.0, step=0.1, help="Less than 1 brightens warm regions, greater than 1 compresses highlights")
 
     steps            = st.number_input("Time steps", min_value=1, value=200)
     parcels_per_step = st.number_input("Parcels per step r", min_value=1, value=10)
@@ -618,11 +476,12 @@ if run_btn:
         source_mode=str(source_mode), tau_g=float(tau_g), plateau_steps=int(plateau_steps), tau_d=float(tau_d),
         allow_diagonals=bool(allow_diagonals), epsilon_baseline=float(epsilon_baseline),
         lambda_per_Ta=float(lambda_per_Ta), distance_penalty=bool(distance_penalty), disable_gravity=bool(disable_gravity),
+        beta_transfer=float(beta_transfer),
         boundary_mode=str(boundary_mode),
         epsilon_diffusion=float(epsilon_diffusion),
         barrier_enabled=bool(barrier_enabled), barrier_y0=int(barrier_y0), barrier_x0=int(barrier_x0), barrier_y1=int(barrier_y1), barrier_x1=int(barrier_x1),
     )
-    
+    )
     st.session_state.params = params
 
     # Progress UI
