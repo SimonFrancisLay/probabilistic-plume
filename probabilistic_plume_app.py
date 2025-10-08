@@ -1,11 +1,12 @@
 """
 Probabilistic plume model, Streamlit app
 Flux (conservative) engine with exponential dT weighting, optional diagonals, gravity toggle,
-source schedules, boundary modes, rectangular adiabatic barrier, background diffusion,
-progress/live updates, snapshot slider, diagnostics, export, and UI helper refactor.
+vertical tilt with lateral clamp, source schedules, boundary modes, rectangular adiabatic barrier,
+background diffusion, progress/live updates, snapshot slider, diagnostics, export, and UI helper refactor.
 
-Now includes vertical tilt B: a temperature dependent vertical bias factor V(T) = exp(mu * max(T/T_a - 1, 0)).
-Up directions are multiplied by V, down directions are divided by V.
+New in this version
+- Source region is a centered square covering configurable percent of total cells (default 5%).
+- Vertical tilt μ also clamps pure lateral moves, tightening plume angle.
 
 Run locally:
 1) pip install -r requirements.txt
@@ -55,13 +56,15 @@ class SimParams:
     tau_g: float = 20.0
     plateau_steps: int = 50
     tau_d: float = 40.0
+    # Source geometry
+    source_area_frac: float = 0.05    # centered square area as fraction of total cells
     # Movement model parameters
     allow_diagonals: bool = True
     epsilon_baseline: float = 0.005   # floor in directional weights
     lambda_per_Ta: float = 1.4        # λ_eff = lambda_per_Ta / T_a
     distance_penalty: bool = True     # diagonals get 1/√2 if True
     disable_gravity: bool = False     # flattens directional priors
-    mu_vertical_tilt: float = 1.0     # NEW: strength of temperature dependent vertical tilt
+    mu_vertical_tilt: float = 1.0     # strength of temperature dependent vertical tilt
     # Flux engine control
     beta_transfer: float = 0.3        # fraction of excess exported per step
     # Background diffusion
@@ -84,7 +87,7 @@ class SimResults:
     params: SimParams
 
 # =============================
-# Helpers: source schedule, neighbours, weights
+# Helpers: source schedule, source region, neighbours, weights
 # =============================
 
 def source_multiplier(t: int, p: SimParams) -> float:
@@ -96,7 +99,7 @@ def source_multiplier(t: int, p: SimParams) -> float:
         return 1.0 + (p.k - 1.0) * (1.0 - math.exp(-max(t, 0) / max(p.tau_g, 1e-9)))
     # Grow-plateau-decay
     s_grow = 1.0 + (p.k - 1.0) * (1.0 - math.exp(-max(t, 0) / max(p.tau_g, 1e-9)))
-    # Heuristic plateau start: when growth reaches 99 percent of k
+    # Heuristic plateau start: when growth reaches ~99% of k
     t_star = 0 if p.k <= 1.0 else int(max(0.0, np.ceil(-p.tau_g * np.log(max(1e-9, (p.k - 1.0) * 0.01 / max(p.k - 1.0, 1e-9))))))
     t_plateau_end = t_star + int(max(0, p.plateau_steps))
     if t < t_star:
@@ -106,11 +109,31 @@ def source_multiplier(t: int, p: SimParams) -> float:
     return 1.0 + (p.k - 1.0) * np.exp(-(t - t_plateau_end) / max(p.tau_d, 1e-9))
 
 
+def source_region_coords(N: int, frac: float) -> Tuple[int, int, int, int]:
+    """Return (y0, y1, x0, x1) for a centered square whose area ~ frac * N*N.
+    Ensures at least 1×1 and uses odd side for symmetry about centre.
+    """
+    frac = float(np.clip(frac, 0.0, 1.0))
+    if frac <= 0.0:
+        c = N // 2
+        return c, c, c, c
+    side = max(1, int(round(np.sqrt(frac) * N)))
+    if side % 2 == 0:
+        side = min(side + 1, N)
+    c = N // 2
+    half = side // 2
+    y0 = max(0, c - half)
+    y1 = min(N - 1, c + half)
+    x0 = max(0, c - half)
+    x1 = min(N - 1, c + half)
+    return y0, y1, x0, x1
+
+
 def init_grid(params: SimParams) -> np.ndarray:
     N = params.N
     T = np.full((N, N), params.T_a, dtype=np.float64)
-    c = N // 2
-    T[c, c] = params.k * params.T_a
+    y0, y1, x0, x1 = source_region_coords(N, params.source_area_frac)
+    T[y0:y1+1, x0:x1+1] = params.k * params.T_a
     return T
 
 # origin="lower": increasing i is visually up
@@ -144,7 +167,7 @@ def _direction_priors(T_particle: float, params: SimParams) -> Dict[str, float]:
         "up": b,
         "up_left": 0.7 * b, "up_right": 0.7 * b,
         "left": 0.5, "right": 0.5,
-        "down": 0.2, "down_left": 0.1, "down_right": 0.1,  # slightly reduced default down priors
+        "down": 0.2, "down_left": 0.1, "down_right": 0.1,  # reduced down priors
     }
 
 
@@ -158,21 +181,20 @@ def _distance_penalty(params: SimParams) -> Dict[str, float]:
 
 def compute_flux_weights(T_particle: float, T_neighbors: Dict[str, float], *, params: SimParams) -> Dict[str, float]:
     """Weights for directional flux out of a cell.
-    Exponential ΔT term, directional priors, diagonal penalty, and vertical tilt V(T).
-    Up directions × V, down directions ÷ V, where V = exp(mu * max(T/T_a - 1, 0)).
+    Exponential ΔT term, directional priors, diagonal penalty, and temperature dependent vertical tilt V(T).
+    Up directions × V, down and lateral directions ÷ V, where V = exp(mu * max(T/T_a - 1, 0)).
     """
     eps = max(0.0, params.epsilon_baseline)
     lam_eff = params.lambda_per_Ta / max(params.T_a, 1e-12)
     P = _direction_priors(T_particle, params)
     C = _distance_penalty(params)
 
-    # Vertical tilt B
+    # Vertical tilt B with lateral clamp
     rel = max(T_particle / max(params.T_a, 1e-12) - 1.0, 0.0)
     V = float(np.exp(params.mu_vertical_tilt * rel))
-
     up_dirs = {"up", "up_left", "up_right"}
     down_dirs = {"down", "down_left", "down_right"}
-    lateral_dirs = {"left", "right"}  # clamp pure lateral when the cell is hot
+    lateral_dirs = {"left", "right"}
 
     w: Dict[str, float] = {}
     for d, Tn in T_neighbors.items():
@@ -181,14 +203,12 @@ def compute_flux_weights(T_particle: float, T_neighbors: Dict[str, float], *, pa
         dT = T_particle - Tn
         g = np.exp(lam_eff * dT) - 1.0 if dT > 0 else 0.0
         weight = (eps + g) * P[d] * C.get(d, 1.0)
-
         if d in up_dirs:
             weight *= V
         elif d in down_dirs and V > 0:
             weight /= V
         elif d in lateral_dirs and V > 0:
             weight /= V
-
         w[d] = max(0.0, float(weight))
     return w
 
@@ -357,6 +377,7 @@ def run_simulation(
         "sink_loss": [(0, 0.0)],
     }
 
+    # Centre index for profiles only
     c = params.N // 2
 
     for t in range(1, params.steps + 1):
@@ -365,7 +386,15 @@ def run_simulation(
         # Source forcing while hotter than ambient
         T_source = source_multiplier(t, params) * params.T_a
         if T_source > params.T_a + 1e-6:
-            T[c, c] = T_source
+            y0, y1, x0, x1 = source_region_coords(params.N, params.source_area_frac)
+            if barrier_mask is not None:
+                block = T[y0:y1+1, x0:x1+1]
+                mask_block = barrier_mask[y0:y1+1, x0:x1+1]
+                block[~mask_block] = T_source
+                T[y0:y1+1, x0:x1+1] = block
+            else:
+                T[y0:y1+1, x0:x1+1] = T_source
+
         T, diag = flux_step(T, params=params, barrier_mask=barrier_mask)
         if t % params.snapshot_stride == 0 or t == params.steps:
             snapshots.append((t, T.copy()))
@@ -451,7 +480,7 @@ def request_stop():
     st.session_state.stop_requested = True
 
 st.title("Probabilistic buoyant plume: flux model")
-st.caption("Conservative flux transport with exponential dT weighting and temperature dependent vertical tilt.")
+st.caption("Conservative flux transport with exponential dT weighting, vertical tilt, and extended source region.")
 
 with st.sidebar:
     st.header("Controls")
@@ -468,6 +497,12 @@ with st.sidebar:
     with col_s3:
         tau_d = st.number_input("Decay tau (steps)", min_value=1.0, value=40.0)
 
+    source_area_pct = st.slider(
+        "Source area (% of grid cells)",
+        min_value=0.5, max_value=25.0, value=5.0, step=0.5,
+        help="The source is a centered square covering this percent of total cells",
+    )
+
     alpha = st.slider("Mixing fraction alpha (optional)", 0.0, 1.0, 0.5, help="Only used if you later enable post-flux smoothing")
 
     st.subheader("Movement model")
@@ -479,7 +514,7 @@ with st.sidebar:
 
     st.subheader("Flux transfer")
     beta_transfer = st.slider("Export fraction per step β", 0.0, 0.8, 0.3, 0.05)
-    mu_vertical_tilt = st.slider("Vertical tilt μ", 0.0, 3.0, 1.0, 0.1, help="Scales up weights for upward moves and scales down weights for downward moves as T rises above T_a")
+    mu_vertical_tilt = st.slider("Vertical tilt μ", 0.0, 3.0, 1.0, 0.1, help="Up weights ×V, down/lateral weights ÷V as T rises above T_a")
 
     boundary_mode = st.selectbox("Boundary mode", ["Outflow", "Blocked", "Periodic"], index=0)
 
@@ -512,6 +547,7 @@ if run_btn:
         steps=int(steps), parcels_per_step=int(parcels_per_step),
         seed=int(seed), snapshot_stride=int(snapshot_stride),
         source_mode=str(source_mode), tau_g=float(tau_g), plateau_steps=int(plateau_steps), tau_d=float(tau_d),
+        source_area_frac=float(source_area_pct) / 100.0,
         allow_diagonals=bool(allow_diagonals), epsilon_baseline=float(epsilon_baseline),
         lambda_per_Ta=float(lambda_per_Ta), distance_penalty=bool(distance_penalty), disable_gravity=bool(disable_gravity),
         mu_vertical_tilt=float(mu_vertical_tilt),
