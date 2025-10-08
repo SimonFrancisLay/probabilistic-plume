@@ -1,5 +1,5 @@
 """
-Probabilistic plume model, Streamlit app
+Probabilistic plume model, Streamlit app (persistent engine) with progress bar and correct 'up' orientation
 
 Run locally:
 1) pip install -r requirements.txt
@@ -52,7 +52,7 @@ class SimParams:
     k: float = 5.0
     alpha: float = 0.5  # mixing fraction
     steps: int = 200
-    parcels_per_step: int = 1
+    parcels_per_step: int = 10
     seed: int = 42
     snapshot_stride: int = 10  # take a field snapshot every this many steps
 
@@ -66,7 +66,7 @@ class SimResults:
 
 
 # -----------------------------
-# Core model helpers
+# Core model helpers (persistent engine)
 # -----------------------------
 
 def init_grid(params: SimParams) -> np.ndarray:
@@ -77,11 +77,13 @@ def init_grid(params: SimParams) -> np.ndarray:
     T[c, c] = params.k * params.T_a
     return T
 
+# IMPORTANT: display uses origin="lower", so increasing row index i moves visually UP.
+# Therefore, define 'up' as (i + 1, j) so that 'up' in the model matches 'up' on the heatmap.
 
 def neighbor_map(i: int, j: int, N: int) -> Dict[str, Optional[Tuple[int, int]]]:
     return {
-        "up": (i - 1, j) if i - 1 >= 0 else None,
-        "down": (i + 1, j) if i + 1 < N else None,
+        "up": (i + 1, j) if i + 1 < N else None,
+        "down": (i - 1, j) if i - 1 >= 0 else None,
         "left": (i, j - 1) if j - 1 >= 0 else None,
         "right": (i, j + 1) if j + 1 < N else None,
     }
@@ -98,13 +100,8 @@ def choose_move_weights(T_particle: float, T_neighbors: Dict[str, float], T_a: f
             weights[d] = b if d == "up" else 1.0
     return weights
 
-
-# -----------------------------
-# Engine V2: persistent parcels
-# -----------------------------
-# Each parcel carries its own temperature that decays via mixing along its path.
-# We also inject new parcels each step at the source.
-
+# Persistent parcel representation
+from dataclasses import dataclass
 @dataclass
 class Parcel:
     i: int
@@ -127,7 +124,6 @@ def step_once_persistent(T: np.ndarray, parcels: List[Parcel], params: SimParams
     moved_up = 0
     total_moves = 0
 
-    # Decide moves for all parcels based on field T at time t
     new_parcels: List[Parcel] = []
     for p in parcels:
         nbrs = neighbor_map(p.i, p.j, N)
@@ -136,38 +132,33 @@ def step_once_persistent(T: np.ndarray, parcels: List[Parcel], params: SimParams
         total_w = sum(weights.values())
 
         if total_w <= 0.0:
-            # Stay
             di, dj = p.i, p.j
+            chosen_dir = None
         else:
             dirs = list(weights.keys())
             probs = np.array([weights[d] for d in dirs], dtype=np.float64)
             probs /= probs.sum()
             choice = rng.choice(len(dirs), p=probs)
-            di, dj = neighbor_map(p.i, p.j, N)[dirs[choice]]
+            chosen_dir = dirs[choice]
+            di, dj = neighbor_map(p.i, p.j, N)[chosen_dir]
             total_moves += 1
-            if dirs[choice] == "up":
+            if chosen_dir == "up":
                 moved_up += 1
 
-        # Record arrival with the parcel's current temperature
         arrivals_T[di][dj].append(p.T)
-        # Update parcel position; new temperature will be set after mixing
         new_parcels.append(Parcel(di, dj, p.T))
 
     # Apply mixing at destinations to produce T_next and update parcel temps
     T_next = T.copy()
-    for p in new_parcels:
-        # Only compute mixing once per destination cell; use the full list of incoming temps
-        # We will handle by applying sequential α-mixing for each incoming parcel temperature
-        # This is deterministic given iteration order over the list
-        di, dj = p.i, p.j
-        if arrivals_T[di][dj]:
-            T_cell = T_next[di, dj]
-            for Tin in arrivals_T[di][dj]:
-                T_cell = (1.0 - params.alpha) * T_cell + params.alpha * Tin
-            T_next[di, dj] = T_cell
+    for di in range(N):
+        for dj in range(N):
+            if arrivals_T[di][dj]:
+                T_cell = T_next[di][dj]
+                for Tin in arrivals_T[di][dj]:
+                    T_cell = (1.0 - params.alpha) * T_cell + params.alpha * Tin
+                T_next[di][dj] = T_cell
 
     # Update parcel temperatures to the mixed destination cell temperature
-    # Parcels that share a destination share the same new temperature
     final_parcels: List[Parcel] = []
     for p in new_parcels:
         p.T = T_next[p.i, p.j]
@@ -191,8 +182,6 @@ def step_once_persistent(T: np.ndarray, parcels: List[Parcel], params: SimParams
 def run_simulation(params: SimParams) -> SimResults:
     rng = np.random.default_rng(params.seed)
     T = init_grid(params)
-
-    # Maintain persistent parcel list
     parcels: List[Parcel] = []
 
     snapshots: List[Tuple[int, np.ndarray]] = [(0, T.copy())]
@@ -204,12 +193,25 @@ def run_simulation(params: SimParams) -> SimResults:
         "active_parcels": [(0, 0.0)],
     }
 
+    # Progress bar and status text
+    prog = st.progress(0, text="Starting simulation…")
+    status = st.empty()
+
     for t in range(1, params.steps + 1):
         T, parcels, diag = step_once_persistent(T, parcels, params, rng)
         if t % params.snapshot_stride == 0 or t == params.steps:
             snapshots.append((t, T.copy()))
         for k, v in diag.items():
             diagnostics.setdefault(k, []).append((t, v))
+
+        # Update progress each step
+        pct = int(100 * t / params.steps)
+        status_text = f"Step {t}/{params.steps} · active parcels={int(diag['active_parcels'])} · frac_up={diag['frac_moves_up']:.2f}"
+        prog.progress(pct, text=status_text)
+        status.write(status_text)
+
+    # Clear progress when done
+    prog.empty()
 
     return SimResults(T=T, snapshots=snapshots, diagnostics=diagnostics, params=params)
 
@@ -219,7 +221,7 @@ def run_simulation(params: SimParams) -> SimResults:
 # -----------------------------
 
 st.title("Probabilistic buoyant plume: minimal model")
-st.caption("Biased random walk with mixing, read t then write t+1, batched mixing")
+st.caption("Batched, non-persistent parcels; read t then write t+1")
 
 with st.sidebar:
     st.header("Controls")
@@ -328,6 +330,6 @@ if res is not None:
 st.markdown(
     """
     ---
-    Notes: this engine uses batched mixing and a read t, write t+1 update. Later we will add the Brownian floor and directional persistence as optional features.
+    Notes: non-persistent parcels with batched mixing. Later we will add the Brownian floor and directional persistence as optional features.
     """
 )
