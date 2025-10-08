@@ -253,14 +253,15 @@ def step_once_persistent(
     N = params.N
     c = N // 2
 
-    # Clamp source cell and inject r new parcels
+    # Clamp source cell and inject r new parcels only if source is hotter than ambient
     if barrier_mask is not None and barrier_mask[c, c]:
         st.warning("Barrier overlaps the source cell; source cell will be exempt from the barrier.")
         barrier_mask = barrier_mask.copy()
         barrier_mask[c, c] = False
-    T[c, c] = T_source
-    for _ in range(params.parcels_per_step):
-        parcels.append(Parcel(c, c, T_source))
+    if T_source > params.T_a + 1e-6:
+        T[c, c] = T_source
+        for _ in range(params.parcels_per_step):
+            parcels.append(Parcel(c, c, T_source))
 
     # Arrival buckets per destination cell
     arrivals_T: List[List[List[float]]] = [[[] for _ in range(N)] for __ in range(N)]
