@@ -1,7 +1,8 @@
 """
 Probabilistic plume model, Streamlit app
 Persistent parcels, exponential dT movement with optional diagonals, scheduled source profiles,
-live progress and updates, snapshot slider, configurable boundary modes, and an optional adiabatic barrier block.
+live progress and updates, snapshot slider, configurable boundary modes, rectangular adiabatic barrier,
+colormap controls, and a gravity toggle.
 
 Run locally:
 1) pip install -r requirements.txt
@@ -68,6 +69,7 @@ class SimParams:
     epsilon_baseline: float = 0.005  # small floor so motion never stalls
     lambda_per_Ta: float = 1.4       # effective lambda is lambda_per_Ta / T_a
     distance_penalty: bool = True    # multiply diagonal weights by 1/sqrt(2)
+    disable_gravity: bool = False    # if True, remove directional buoyancy bias
     # Boundary handling
     boundary_mode: str = "Outflow"   # options: Outflow, Blocked, Periodic
     # Adiabatic barrier block
@@ -144,22 +146,30 @@ def neighbor_map(
 def compute_move_weights_exp(T_particle: float, T_neighbors: Dict[str, float], params: SimParams) -> Dict[str, float]:
     """Exponential dT weighting with directional priors and optional distance penalty.
     w_d = [eps + max(exp(lambda * dT) - 1, 0)] * P_dir(d) * C_dist(d),  dT = T_p - T_n
-    Direction priors favour up, then up diagonals, then lateral, then down.
+    Direction priors favour up, then up diagonals, then lateral, then down. Can be disabled with disable_gravity.
     """
     eps = max(0.0, params.epsilon_baseline)
     lam_eff = params.lambda_per_Ta / max(params.T_a, 1e-12)
 
-    b = T_particle / params.T_a  # buoyancy factor
-    P_dir = {
-        "up": b,
-        "up_left": 0.7 * b,
-        "up_right": 0.7 * b,
-        "left": 0.5,
-        "right": 0.5,
-        "down": 0.3,
-        "down_left": 0.2,
-        "down_right": 0.2,
-    }
+    if params.disable_gravity:
+        base = 1.0
+        P_dir = {
+            "up": base, "up_left": base, "up_right": base,
+            "left": base, "right": base,
+            "down": base, "down_left": base, "down_right": base,
+        }
+    else:
+        b = T_particle / params.T_a  # buoyancy factor
+        P_dir = {
+            "up": b,
+            "up_left": 0.7 * b,
+            "up_right": 0.7 * b,
+            "left": 0.5,
+            "right": 0.5,
+            "down": 0.3,
+            "down_left": 0.2,
+            "down_right": 0.2,
+        }
     C_dist = {
         "up": 1.0, "down": 1.0, "left": 1.0, "right": 1.0,
         "up_left": (1.0 / np.sqrt(2)) if params.distance_penalty else 1.0,
@@ -434,6 +444,7 @@ with st.sidebar:
     epsilon_baseline = st.slider("Baseline eps (floor)", 0.0, 0.05, 0.005, step=0.001, help="Small floor so motion never stalls")
     lambda_per_Ta    = st.slider("dT sensitivity lambda (per T_a)", 0.0, 3.0, 1.4, step=0.05, help="Effective lambda is lambda/T_a")
     distance_penalty = st.checkbox("Distance penalty for diagonals (1/sqrt(2))", value=True)
+    disable_gravity  = st.checkbox("Disable gravity bias", value=False, help="Treat all directions equally; only dT and distance penalty apply")
 
     boundary_mode = st.selectbox("Boundary mode", ["Outflow", "Blocked", "Periodic"], index=0, help="Outflow removes parcels that step out; Blocked ignores off-grid moves; Periodic wraps around")
 
@@ -474,11 +485,9 @@ if run_btn:
         seed=int(seed), snapshot_stride=int(snapshot_stride),
         source_mode=str(source_mode), tau_g=float(tau_g), plateau_steps=int(plateau_steps), tau_d=float(tau_d),
         allow_diagonals=bool(allow_diagonals), epsilon_baseline=float(epsilon_baseline),
-        lambda_per_Ta=float(lambda_per_Ta), distance_penalty=bool(distance_penalty),
+        lambda_per_Ta=float(lambda_per_Ta), distance_penalty=bool(distance_penalty), disable_gravity=bool(disable_gravity),
         boundary_mode=str(boundary_mode),
-        barrier_enabled=bool(barrier_enabled),
-        barrier_y0=int(barrier_y0), barrier_x0=int(barrier_x0),
-        barrier_y1=int(barrier_y1), barrier_x1=int(barrier_x1),
+        barrier_enabled=bool(barrier_enabled), barrier_y0=int(barrier_y0), barrier_x0=int(barrier_x0), barrier_y1=int(barrier_y1), barrier_x1=int(barrier_x1),
     )
     st.session_state.params = params
 
@@ -605,6 +614,6 @@ if res is not None:
 st.markdown(
     """
     ---
-    Notes: persistent parcels with scheduled source options (persistent, grow, grow plateau decay) and exponential dT movement with optional diagonals. No global diffusion in this version. Supports Outflow, Blocked, or Periodic boundaries, plus an optional adiabatic rectangular barrier.
+    Notes: persistent parcels with scheduled source options (persistent, grow, grow plateau decay) and exponential dT movement with optional diagonals. No global diffusion in this version. Supports Outflow, Blocked, or Periodic boundaries, plus an optional adiabatic rectangular barrier. Includes a gravity toggle to remove directional priors if desired.
     """
 )
