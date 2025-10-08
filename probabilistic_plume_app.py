@@ -60,6 +60,13 @@ class SimParams:
     tau_g: float = 20.0  # growth time constant (steps)
     plateau_steps: int = 50  # plateau duration (steps)
     tau_d: float = 40.0  # decay time constant (steps)
+    # Background diffusion (global neighbour mixing each step)
+    epsilon_diffusion: float = 0.0  # 0 disables; applied over 8 neighbours (Moore)
+    # Source scheduling
+    source_mode: str = "Persistent"  # options: Persistent, Grow, Grow-plateau-decay
+    tau_g: float = 20.0  # growth time constant (steps)
+    plateau_steps: int = 50  # plateau duration (steps)
+    tau_d: float = 40.0  # decay time constant (steps)
 
 
 @dataclass
@@ -81,7 +88,6 @@ def request_stop():
 
 # -----------------------------
 # Core model helpers (persistent engine)
-# ----------------------------- (persistent engine)
 # -----------------------------
 
 def init_grid(params: SimParams) -> np.ndarray:
@@ -219,6 +225,22 @@ def source_multiplier(t: int, p: SimParams) -> float:
     td = max(p.tau_d, 1e-9)
     return 1.0 + (p.k - 1.0) * math.exp(-(t - t_plateau_end) / td)
 
+def diffuse8(T: np.ndarray, eps: float) -> np.ndarray:
+    """Apply background diffusion toward the 8-neighbour (Moore) average.
+    T_new = (1-eps)*T + eps*mean(neighbours_8). Uses edge padding to mimic reflecting boundaries.
+    """
+    if eps <= 0.0:
+        return T
+    pad = np.pad(T, 1, mode='edge')
+    # Sum of 8 neighbours (exclude center)
+    nsum = (
+        pad[0:-2, 0:-2] + pad[0:-2, 1:-1] + pad[0:-2, 2:  ] +
+        pad[1:-1, 0:-2] +                     pad[1:-1, 2:  ] +
+        pad[2:  , 0:-2] + pad[2:  , 1:-1] + pad[2:  , 2:  ]
+    )
+    navg = nsum / 8.0
+    return (1.0 - eps) * T + eps * navg
+
 def run_simulation(
     params: SimParams,
     *,
@@ -255,6 +277,8 @@ def run_simulation(
         # compute source temp for this step
         T_source = source_multiplier(t, params) * params.T_a
         T, parcels, diag = step_once_persistent(T, parcels, params, rng, T_source)
+        # Background diffusion over 8 neighbours
+        T = diffuse8(T, params.epsilon_diffusion)
         if t % params.snapshot_stride == 0 or t == params.steps:
             snapshots.append((t, T.copy()))
         for k, v in diag.items():
@@ -272,6 +296,7 @@ def run_simulation(
                 im = ax_live.imshow(T / params.T_a, origin="lower", interpolation="nearest")
                 ax_live.set_title(f"Live field at t = {t}")
                 live_placeholder.pyplot(fig_live, clear_figure=True)
+                plt.close(fig_live)
                 plt.close(fig_live)
             except Exception:
                 pass
@@ -302,6 +327,9 @@ with st.sidebar:
         tau_d = st.number_input("Decay tau (steps)", min_value=1.0, value=40.0)
 
     alpha = st.slider("Mixing fraction alpha", min_value=0.0, max_value=1.0, value=0.5)
+    epsilon_diffusion = st.slider("Background diffusion ε (8-neighbour)", min_value=0.0, max_value=0.2, value=0.0, step=0.005,
+                                  help="Each step, blend a fraction ε of each cell with the average of its 8 neighbours")
+
     steps = st.number_input("Time steps", min_value=1, value=200)
     parcels_per_step = st.number_input("Parcels per step r", min_value=1, value=10)
     seed = st.number_input("Random seed", min_value=0, value=42)
@@ -331,7 +359,8 @@ if run_btn:
         N=int(N), T_a=float(T_a), k=float(k), alpha=float(alpha),
         steps=int(steps), parcels_per_step=int(parcels_per_step),
         seed=int(seed), snapshot_stride=int(snapshot_stride),
-        source_mode=str(source_mode), tau_g=float(tau_g), plateau_steps=int(plateau_steps), tau_d=float(tau_d)
+        source_mode=str(source_mode), tau_g=float(tau_g), plateau_steps=int(plateau_steps), tau_d=float(tau_d),
+        epsilon_diffusion=float(epsilon_diffusion)
     )
     st.session_state.params = params
 
@@ -391,10 +420,11 @@ else:
         with col1:
             st.pyplot(fig1, clear_figure=True)
         plt.close(fig1)
+        plt.close(fig1)
 
         # Centreline profile above the source
         c = res.params.N // 2
-        profile = T_sel[c:, c] / res.params.T_a  # from centre upward
+        profile = T_sel[c:, c] / res.params.T_a  # centreline using selected snapshot  # from centre upward
         y = np.arange(profile.size)
         fig2, ax2 = plt.subplots(figsize=(6, 4))
         ax2.plot(profile, y)
@@ -403,6 +433,7 @@ else:
         ax2.set_title("Centreline profile above source")
         with col2:
             st.pyplot(fig2, clear_figure=True)
+        plt.close(fig2)
         plt.close(fig2)
 
         # Diagnostics time series
@@ -416,6 +447,7 @@ else:
         ax3.legend()
         with col2:
             st.pyplot(fig3, clear_figure=True)
+        plt.close(fig3)
         plt.close(fig3)
 
 # -----------------------------
@@ -445,6 +477,6 @@ if res is not None:
 st.markdown(
     """
     ---
-    Notes: persistent parcels with scheduled source options (persistent, grow, grow–plateau–decay). Later we will add the Brownian floor and directional persistence as optional features.
+    Notes: persistent parcels with scheduled source options (persistent, grow, grow–plateau–decay) and optional 8‑neighbour background diffusion ε. Later we will add the Brownian floor and directional persistence as optional features.
     """
 )
