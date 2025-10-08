@@ -70,6 +70,8 @@ class SimParams:
     lambda_per_Ta: float = 1.4       # effective lambda is lambda_per_Ta / T_a
     distance_penalty: bool = True    # multiply diagonal weights by 1/sqrt(2)
     disable_gravity: bool = False    # if True, remove directional buoyancy bias
+    # Background diffusion
+    epsilon_diffusion: float = 0.02  # per-step Moore-neighbour mixing; 0 disables
     # Boundary handling
     boundary_mode: str = "Outflow"   # options: Outflow, Blocked, Periodic
     # Adiabatic barrier block
@@ -78,6 +80,7 @@ class SimParams:
     barrier_x0: int = 20   # left col j, inclusive
     barrier_y1: int = 70   # top row i, inclusive
     barrier_x1: int = 80   # right col j, inclusive
+
 
 
 @dataclass
@@ -250,6 +253,77 @@ def compute_default_barrier(N: int) -> Tuple[int, int, int, int]:
     """
     if N <= 0:
         return 0, 0, 0, 0
+    centre = N // 2
+    top = N - 1
+    centre_to_top_mid = int(round((centre + top) / 2))
+    thickness = max(1, int(round(0.05 * N)))
+    y0 = centre_to_top_mid - thickness // 2
+    y1 = y0 + thickness - 1
+    y0 = max(0, min(N - 1, y0))
+    y1 = max(0, min(N - 1, y1))
+    if y1 < y0:
+        y1 = y0
+    x0 = int(round(0.25 * (N - 1)))
+    x1 = int(round((2.0 / 3.0) * (N - 1)))
+    x0 = max(0, min(N - 1, x0))
+    x1 = max(0, min(N - 1, x1))
+    if x1 < x0:
+        x1 = x0
+    return y0, y1, x0, x1
+
+
+def background_diffuse(T: np.ndarray, params: SimParams, barrier_mask: Optional[np.ndarray]) -> np.ndarray:
+    """Apply simple background diffusion with Moore neighbours.
+    Uses Neumann-like edges for Outflow/Blocked via edge padding; Periodic wraps.
+    Does not allow heat into barrier cells; they are reset to T_a after diffusion.
+    """
+    eps = max(0.0, float(params.epsilon_diffusion))
+    if eps <= 0.0:
+        return T
+    N = params.N
+
+    if params.boundary_mode == "Periodic":
+        # 8-neighbour mean via rolls
+        up = np.roll(T, -1, axis=0)
+        down = np.roll(T, 1, axis=0)
+        left = np.roll(T, 1, axis=1)
+        right = np.roll(T, -1, axis=1)
+        ul = np.roll(up, 1, axis=1)
+        ur = np.roll(up, -1, axis=1)
+        dl = np.roll(down, 1, axis=1)
+        dr = np.roll(down, -1, axis=1)
+        neigh_mean = (up + down + left + right + ul + ur + dl + dr) / 8.0
+    else:
+        # Edge padded to emulate zero-flux boundaries
+        Tp = np.pad(T, ((1, 1), (1, 1)), mode='edge')
+        c = Tp[1:-1, 1:-1]
+        up = Tp[2:, 1:-1]
+        down = Tp[:-2, 1:-1]
+        left = Tp[1:-1, :-2]
+        right = Tp[1:-1, 2:]
+        ul = Tp[2:, :-2]
+        ur = Tp[2:, 2:]
+        dl = Tp[:-2, :-2]
+        dr = Tp[:-2, 2:]
+        neigh_mean = (up + down + left + right + ul + ur + dl + dr) / 8.0
+
+    T_new = (1.0 - eps) * T + eps * neigh_mean
+
+    if barrier_mask is not None:
+        # enforce adiabatic cells remain at ambient
+        T_new[barrier_mask] = params.T_a
+    return T_new
+
+
+
+def compute_default_barrier(N: int) -> Tuple[int, int, int, int]:
+    """Default rectangular barrier based on N.
+    Vertically: centred halfway between centre and top, thickness = 5 percent of N (at least 1).
+    Horizontally: spans from 1/4 to 2/3 of the width.
+    Returns (y0, y1, x0, x1), clamped to grid.
+    """
+    if N <= 0:
+        return 0, 0, 0, 0
     # Vertical placement
     centre = N // 2
     top = N - 1
@@ -373,11 +447,15 @@ def step_once_persistent(
                     T_cell = (1.0 - params.alpha) * T_cell + params.alpha * Tin
                 T_next[di][dj] = T_cell
 
+    # Apply global background diffusion
+    T_next = background_diffuse(T_next, params, barrier_mask)
+
     # Update parcels to mixed destination cell temperature
     final_parcels: List[Parcel] = []
     for p in new_parcels:
         p.T = T_next[p.i, p.j]
         final_parcels.append(p)
+
 
     # Diagnostics
     diag: Dict[str, float] = {}
@@ -500,11 +578,18 @@ with st.sidebar:
     barrier_y0 = st.number_input("Barrier bottom row i0 (0=bottom)", min_value=0, max_value=int(N-1), value=int(st.session_state.barrier_y0))
     barrier_y1 = st.number_input("Barrier top row i1",                 min_value=0, max_value=int(N-1), value=int(st.session_state.barrier_y1))
     barrier_x0 = st.number_input("Barrier left col j0",                min_value=0, max_value=int(N-1), value=int(st.session_state.barrier_x0))
-    barrier_x1 = st.number_input("Barrier right col j1",               min_value=0, max_value=int(N-1), value=int(st.session_state.barrier_x1))
+    barrier_x1 = st.number_input("Barrier right col j1",               min_value=0, max_value=int(N-1), value=int(st.session_state.barrier_x1)), value=int(N-20))
 
     st.subheader("Color mapping")
     cmap_name = st.selectbox("Colormap", ["inferno", "magma", "viridis", "plasma", "cividis"], index=0, help="Perceptually uniform maps give smooth gradation")
     gamma = st.slider("Contrast (gamma)", min_value=0.3, max_value=2.0, value=1.0, step=0.1, help="Less than 1 brightens warm regions, greater than 1 compresses highlights")
+
+    st.subheader("Background diffusion")
+    epsilon_diffusion = st.slider(
+        "Background diffusion ε",
+        min_value=0.0, max_value=0.2, value=0.02, step=0.005,
+        help="Moore-neighbour mixing per step. Set to 0 to disable."
+    )", min_value=0.3, max_value=2.0, value=1.0, step=0.1, help="Less than 1 brightens warm regions, greater than 1 compresses highlights")
 
     steps            = st.number_input("Time steps", min_value=1, value=200)
     parcels_per_step = st.number_input("Parcels per step r", min_value=1, value=10)
@@ -534,7 +619,9 @@ if run_btn:
         allow_diagonals=bool(allow_diagonals), epsilon_baseline=float(epsilon_baseline),
         lambda_per_Ta=float(lambda_per_Ta), distance_penalty=bool(distance_penalty), disable_gravity=bool(disable_gravity),
         boundary_mode=str(boundary_mode),
+        epsilon_diffusion=float(epsilon_diffusion),
         barrier_enabled=bool(barrier_enabled), barrier_y0=int(barrier_y0), barrier_x0=int(barrier_x0), barrier_y1=int(barrier_y1), barrier_x1=int(barrier_x1),
+    )
     )
     st.session_state.params = params
 
