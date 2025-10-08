@@ -481,7 +481,7 @@ if run_btn:
         epsilon_diffusion=float(epsilon_diffusion),
         barrier_enabled=bool(barrier_enabled), barrier_y0=int(barrier_y0), barrier_x0=int(barrier_x0), barrier_y1=int(barrier_y1), barrier_x1=int(barrier_x1),
     )
-    )
+    
     st.session_state.params = params
 
     # Progress UI
