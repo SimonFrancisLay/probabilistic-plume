@@ -65,12 +65,7 @@ class SimParams:
     epsilon_baseline: float = 0.005  # small floor to avoid stalling
     lambda_per_Ta: float = 1.4       # λ is interpreted per T_a: λ_eff = lambda_per_Ta / T_a
     distance_penalty: bool = True
-    # Source scheduling
-    source_mode: str = "Persistent"  # options: Persistent, Grow, Grow-plateau-decay
-    tau_g: float = 20.0  # growth time constant (steps)
-    plateau_steps: int = 50  # plateau duration (steps)
-    tau_d: float = 40.0  # decay time constant (steps)
-
+   
 
 @dataclass
 class SimResults:
@@ -384,7 +379,6 @@ with st.sidebar:
     )
     stop_btn = st.button("Stop", on_click=request_stop)
     run_btn = st.button("Run simulation", type="primary") 
-    st.number_input("Time steps", min_value=1, value=200)
     parcels_per_step = st.number_input("Parcels per step r", min_value=1, value=10)
     seed = st.number_input("Random seed", min_value=0, value=42)
     snapshot_stride = st.number_input("Snapshot stride", min_value=1, value=10)
