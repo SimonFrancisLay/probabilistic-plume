@@ -291,7 +291,7 @@ for p in parcels:
     diag["frac_moves_up"] = float(frac_up)
     diag["active_parcels"] = float(len(final_parcels))
 
-    return T_next, final_parcels, diag
+return T_next, final_parcels, diag
 
 
 def source_multiplier(t: int, p: SimParams) -> float:
