@@ -379,7 +379,6 @@ with st.sidebar:
     )
     stop_btn = st.button("Stop", on_click=request_stop)
     run_btn = st.button("Run simulation", type="primary") 
-    parcels_per_step = st.number_input("Parcels per step r", min_value=1, value=10)
     seed = st.number_input("Random seed", min_value=0, value=42)
     snapshot_stride = st.number_input("Snapshot stride", min_value=1, value=10)
 
