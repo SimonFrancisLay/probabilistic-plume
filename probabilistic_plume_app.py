@@ -204,12 +204,17 @@ def compute_flux_weights(T_particle: float, T_neighbors: Dict[str, float], *, pa
         dT = T_particle - Tn
         g = np.exp(lam_eff * dT) - 1.0 if dT > 0 else 0.0
         weight = (eps + g) * P[d] * C.get(d, 1.0)
-        if d in up_dirs:
+
+        # Directional tilt scaling
+        if d == "up":
             weight *= V
+        elif d in {"up_left", "up_right"}:
+            weight *= 0.7 * V
         elif d in down_dirs and V > 0:
             weight /= V
         elif d in lateral_dirs and V > 0:
             weight /= V
+
         w[d] = max(0.0, float(weight))
     return w
 
