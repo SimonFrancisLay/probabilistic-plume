@@ -1,7 +1,7 @@
 """
 Probabilistic plume model, Streamlit app
 Persistent parcels, exponential dT movement with optional diagonals, scheduled source profiles,
-live progress and updates, snapshot slider, configurable boundary modes, and an optional adiabatic barrier.
+live progress and updates, snapshot slider, configurable boundary modes, and an optional adiabatic barrier block.
 
 Run locally:
 1) pip install -r requirements.txt
@@ -28,6 +28,7 @@ import streamlit as st
 # Try to import matplotlib and warn if unavailable
 try:
     import matplotlib.pyplot as plt
+    from matplotlib.colors import PowerNorm
     HAVE_MPL = True
 except Exception as e:
     HAVE_MPL = False
@@ -69,11 +70,12 @@ class SimParams:
     distance_penalty: bool = True    # multiply diagonal weights by 1/sqrt(2)
     # Boundary handling
     boundary_mode: str = "Outflow"   # options: Outflow, Blocked, Periodic
-    # Adiabatic barrier
+    # Adiabatic barrier block
     barrier_enabled: bool = False
-    barrier_row: int = 60            # row index i (0..N-1), origin lower so larger is higher
-    barrier_x0: int = 20             # inclusive column start j
-    barrier_x1: int = 80             # inclusive column end j
+    barrier_y0: int = 50   # bottom row i, inclusive 0..N-1, origin lower so larger is higher
+    barrier_x0: int = 20   # left col j, inclusive
+    barrier_y1: int = 70   # top row i, inclusive
+    barrier_x1: int = 80   # right col j, inclusive
 
 
 @dataclass
@@ -212,17 +214,21 @@ def source_multiplier(t: int, p: SimParams) -> float:
 
 def build_barrier_mask(N: int, p: SimParams) -> Optional[np.ndarray]:
     """Return a boolean mask of shape (N, N) where True marks adiabatic barrier cells.
-    If disabled or invalid range, return None.
+    Rectangle from (y0, x0) to (y1, x1) inclusive. If disabled or empty, return None.
     """
     if not p.barrier_enabled:
         return None
-    r = int(np.clip(p.barrier_row, 0, N - 1))
-    x0 = int(min(max(p.barrier_x0, 0), N - 1))
-    x1 = int(min(max(p.barrier_x1, 0), N - 1))
-    if x1 < x0:
-        x0, x1 = x1, x0
+
+    y0 = int(np.clip(min(p.barrier_y0, p.barrier_y1), 0, N-1))
+    y1 = int(np.clip(max(p.barrier_y0, p.barrier_y1), 0, N-1))
+    x0 = int(np.clip(min(p.barrier_x0, p.barrier_x1), 0, N-1))
+    x1 = int(np.clip(max(p.barrier_x0, p.barrier_x1), 0, N-1))
+
+    if y1 < y0 or x1 < x0:
+        return None
+
     mask = np.zeros((N, N), dtype=bool)
-    mask[r, x0:x1 + 1] = True
+    mask[y0:y1+1, x0:x1+1] = True
     return mask
 
 
@@ -431,11 +437,16 @@ with st.sidebar:
 
     boundary_mode = st.selectbox("Boundary mode", ["Outflow", "Blocked", "Periodic"], index=0, help="Outflow removes parcels that step out; Blocked ignores off-grid moves; Periodic wraps around")
 
-    st.subheader("Adiabatic barrier")
-    barrier_enabled = st.checkbox("Enable horizontal barrier", value=False, help="Internal cells that do not receive heat and cannot be entered")
-    barrier_row = st.number_input("Barrier row i (0=bottom)", min_value=0, max_value=int(N-1), value=min(int(N//2)+10, int(N-1)))
-    barrier_x0 = st.number_input("Barrier start j", min_value=0, max_value=int(N-1), value=20)
-    barrier_x1 = st.number_input("Barrier end j", min_value=0, max_value=int(N-1), value=int(N-20))
+    st.subheader("Adiabatic barrier block")
+    barrier_enabled = st.checkbox("Enable rectangular barrier", value=False, help="Internal block that does not receive heat and cannot be entered")
+    barrier_y0 = st.number_input("Barrier bottom row i0 (0=bottom)", min_value=0, max_value=int(N-1), value=int(max(0, (N//2) - 10)))
+    barrier_y1 = st.number_input("Barrier top row i1",                 min_value=0, max_value=int(N-1), value=int(min(N-1, (N//2) + 10)))
+    barrier_x0 = st.number_input("Barrier left col j0",                min_value=0, max_value=int(N-1), value=20)
+    barrier_x1 = st.number_input("Barrier right col j1",               min_value=0, max_value=int(N-1), value=int(N-20))
+
+    st.subheader("Color mapping")
+    cmap_name = st.selectbox("Colormap", ["inferno", "magma", "viridis", "plasma", "cividis"], index=0, help="Perceptually uniform maps give smooth gradation")
+    gamma = st.slider("Contrast (gamma)", min_value=0.3, max_value=2.0, value=1.0, step=0.1, help="Less than 1 brightens warm regions, greater than 1 compresses highlights")
 
     steps            = st.number_input("Time steps", min_value=1, value=200)
     parcels_per_step = st.number_input("Parcels per step r", min_value=1, value=10)
@@ -465,7 +476,9 @@ if run_btn:
         allow_diagonals=bool(allow_diagonals), epsilon_baseline=float(epsilon_baseline),
         lambda_per_Ta=float(lambda_per_Ta), distance_penalty=bool(distance_penalty),
         boundary_mode=str(boundary_mode),
-        barrier_enabled=bool(barrier_enabled), barrier_row=int(barrier_row), barrier_x0=int(barrier_x0), barrier_x1=int(barrier_x1),
+        barrier_enabled=bool(barrier_enabled),
+        barrier_y0=int(barrier_y0), barrier_x0=int(barrier_x0),
+        barrier_y1=int(barrier_y1), barrier_x1=int(barrier_x1),
     )
     st.session_state.params = params
 
@@ -515,9 +528,22 @@ else:
         sel = st.slider("View snapshot", 0, len(res.snapshots) - 1, len(res.snapshots) - 1)
         t_sel, T_sel = res.snapshots[sel]
 
+        # Rebuild barrier mask for this run for plotting overlay
+        barrier_mask_plot = build_barrier_mask(res.params.N, res.params)
+
+        # Prepare data with barrier masked so it shows as black
+        data = (T_sel / res.params.T_a).copy()
+        if barrier_mask_plot is not None:
+            data = np.ma.array(data, mask=barrier_mask_plot)
+
+        # Build colormap with adjustable contrast and black for masked cells
+        cmap = plt.get_cmap(cmap_name).copy()
+        cmap.set_bad(color="black")
+        norm = PowerNorm(gamma=gamma)
+
         # Heatmap for selected snapshot
         fig1, ax1 = plt.subplots(figsize=(6, 6))
-        im = ax1.imshow(T_sel / res.params.T_a, origin="lower", interpolation="nearest")
+        im = ax1.imshow(data, origin="lower", interpolation="nearest", cmap=cmap, norm=norm)
         ax1.set_title(f"Field at t = {t_sel} (T/T_a)")
         ax1.set_xlabel("x index")
         ax1.set_ylabel("y index")
@@ -579,6 +605,6 @@ if res is not None:
 st.markdown(
     """
     ---
-    Notes: persistent parcels with scheduled source options (persistent, grow, grow plateau decay) and exponential dT movement with optional diagonals. No global diffusion in this version. Supports Outflow, Blocked, or Periodic boundaries, plus an optional adiabatic horizontal barrier.
+    Notes: persistent parcels with scheduled source options (persistent, grow, grow plateau decay) and exponential dT movement with optional diagonals. No global diffusion in this version. Supports Outflow, Blocked, or Periodic boundaries, plus an optional adiabatic rectangular barrier.
     """
 )
