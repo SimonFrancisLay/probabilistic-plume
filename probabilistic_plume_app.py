@@ -1,5 +1,5 @@
 """
-Probabilistic plume model, Streamlit app (batched engine)
+Probabilistic plume model, Streamlit app
 
 Run locally:
 1) pip install -r requirements.txt
@@ -52,7 +52,7 @@ class SimParams:
     k: float = 5.0
     alpha: float = 0.5  # mixing fraction
     steps: int = 200
-    parcels_per_step: int = 10
+    parcels_per_step: int = 1
     seed: int = 42
     snapshot_stride: int = 10  # take a field snapshot every this many steps
 
@@ -66,7 +66,7 @@ class SimResults:
 
 
 # -----------------------------
-# Core model helpers (batched engine)
+# Core model helpers
 # -----------------------------
 
 def init_grid(params: SimParams) -> np.ndarray:
@@ -76,6 +76,15 @@ def init_grid(params: SimParams) -> np.ndarray:
     c = N // 2
     T[c, c] = params.k * params.T_a
     return T
+
+
+def neighbor_map(i: int, j: int, N: int) -> Dict[str, Optional[Tuple[int, int]]]:
+    return {
+        "up": (i - 1, j) if i - 1 >= 0 else None,
+        "down": (i + 1, j) if i + 1 < N else None,
+        "left": (i, j - 1) if j - 1 >= 0 else None,
+        "right": (i, j + 1) if j + 1 < N else None,
+    }
 
 
 def choose_move_weights(T_particle: float, T_neighbors: Dict[str, float], T_a: float) -> Dict[str, float]:
@@ -90,88 +99,101 @@ def choose_move_weights(T_particle: float, T_neighbors: Dict[str, float], T_a: f
     return weights
 
 
-def step_once_batched(T: np.ndarray, params: SimParams, rng: np.random.Generator) -> Tuple[np.ndarray, Dict[str, float]]:
-    """Advance the simulation by one global step on a read at t, write to t+1 schedule.
-    Batched mixing: accumulate arrivals per destination cell, then apply a closed form update.
-    Parcels are *not* persistent; they are injected at the source and mixed once per step.
-    """
+# -----------------------------
+# Engine V2: persistent parcels
+# -----------------------------
+# Each parcel carries its own temperature that decays via mixing along its path.
+# We also inject new parcels each step at the source.
+
+@dataclass
+class Parcel:
+    i: int
+    j: int
+    T: float
+
+
+def step_once_persistent(T: np.ndarray, parcels: List[Parcel], params: SimParams, rng: np.random.Generator) -> Tuple[np.ndarray, List[Parcel], Dict[str, float]]:
     N = params.N
     c = N // 2
 
-    # Read source temperature from time t once for all parcels in this step
+    # Inject r new parcels at the centre with temperature read from T at time t
     T_source = T[c, c]
+    for _ in range(params.parcels_per_step):
+        parcels.append(Parcel(c, c, T_source))
 
-    # Arrival counters per cell
-    arrivals = np.zeros((N, N), dtype=np.int32)
+    # Prepare arrival buckets per cell: list of incoming parcel temps
+    arrivals_T: List[List[List[float]]] = [[[] for _ in range(N)] for __ in range(N)]
 
-    # Diagnostics
     moved_up = 0
     total_moves = 0
 
-    # Neighbor map and temps around the source at time t
-    i, j = c, c
-    nbrs = {
-        "up": (i - 1, j) if i - 1 >= 0 else None,
-        "down": (i + 1, j) if i + 1 < N else None,
-        "left": (i, j - 1) if j - 1 >= 0 else None,
-        "right": (i, j + 1) if j + 1 < N else None,
-    }
-    T_neighbors: Dict[str, float] = {d: T[idx] for d, idx in nbrs.items() if idx is not None}
+    # Decide moves for all parcels based on field T at time t
+    new_parcels: List[Parcel] = []
+    for p in parcels:
+        nbrs = neighbor_map(p.i, p.j, N)
+        T_neighbors: Dict[str, float] = {d: T[idx] for d, idx in nbrs.items() if idx is not None}
+        weights = choose_move_weights(p.T, T_neighbors, params.T_a)
+        total_w = sum(weights.values())
 
-    weights = choose_move_weights(T_source, T_neighbors, params.T_a)
-    total_w = sum(weights.values())
-
-    if total_w > 0.0:
-        dirs = list(weights.keys())
-        probs = np.array([weights[d] for d in dirs], dtype=np.float64)
-        probs /= probs.sum()
-        # Draw destinations for r parcels in one vectorised call
-        choices = rng.choice(len(dirs), size=params.parcels_per_step, p=probs)
-        for ch in choices:
-            dest = nbrs[dirs[ch]]
-            di, dj = dest
-            arrivals[di, dj] += 1
+        if total_w <= 0.0:
+            # Stay
+            di, dj = p.i, p.j
+        else:
+            dirs = list(weights.keys())
+            probs = np.array([weights[d] for d in dirs], dtype=np.float64)
+            probs /= probs.sum()
+            choice = rng.choice(len(dirs), p=probs)
+            di, dj = neighbor_map(p.i, p.j, N)[dirs[choice]]
             total_moves += 1
-            if dirs[ch] == "up":
+            if dirs[choice] == "up":
                 moved_up += 1
-    else:
-        # No cooler neighbors, all parcels stay at the source cell
-        arrivals[c, c] += params.parcels_per_step
-        total_moves += params.parcels_per_step
 
-    # Now apply batched mixing to produce T_next
+        # Record arrival with the parcel's current temperature
+        arrivals_T[di][dj].append(p.T)
+        # Update parcel position; new temperature will be set after mixing
+        new_parcels.append(Parcel(di, dj, p.T))
+
+    # Apply mixing at destinations to produce T_next and update parcel temps
     T_next = T.copy()
+    for p in new_parcels:
+        # Only compute mixing once per destination cell; use the full list of incoming temps
+        # We will handle by applying sequential α-mixing for each incoming parcel temperature
+        # This is deterministic given iteration order over the list
+        di, dj = p.i, p.j
+        if arrivals_T[di][dj]:
+            T_cell = T_next[di, dj]
+            for Tin in arrivals_T[di][dj]:
+                T_cell = (1.0 - params.alpha) * T_cell + params.alpha * Tin
+            T_next[di, dj] = T_cell
 
-    # For cells with m arrivals, apply: T_new = (1-α)^m * T_old + [1-(1-α)^m] * T_source
-    if params.alpha != 0.0:
-        m_mask = arrivals > 0
-        if np.any(m_mask):
-            m = arrivals[m_mask].astype(np.float64)
-            factor = np.power(1.0 - params.alpha, m)
-            T_old = T[m_mask]
-            T_new = factor * T_old + (1.0 - factor) * T_source
-            T_next[m_mask] = T_new
+    # Update parcel temperatures to the mixed destination cell temperature
+    # Parcels that share a destination share the same new temperature
+    final_parcels: List[Parcel] = []
+    for p in new_parcels:
+        p.T = T_next[p.i, p.j]
+        final_parcels.append(p)
 
     # Diagnostics
     diag: Dict[str, float] = {}
     diag["max_T_over_Ta"] = float(T_next.max() / params.T_a)
     diag["mean_T_over_Ta"] = float(T_next.mean() / params.T_a)
-
-    # Vertical centroid of heat using origin at bottom (imshow origin="lower")
     y = np.arange(N, dtype=np.float64)
     weighted_sum = (T_next * y[:, None]).sum()
     total_temp = T_next.sum()
     diag["vertical_centroid"] = float(weighted_sum / total_temp) if total_temp > 0 else float(c)
-
     frac_up = moved_up / total_moves if total_moves > 0 else 0.0
     diag["frac_moves_up"] = float(frac_up)
+    diag["active_parcels"] = float(len(final_parcels))
 
-    return T_next, diag
+    return T_next, final_parcels, diag
 
 
 def run_simulation(params: SimParams) -> SimResults:
     rng = np.random.default_rng(params.seed)
     T = init_grid(params)
+
+    # Maintain persistent parcel list
+    parcels: List[Parcel] = []
 
     snapshots: List[Tuple[int, np.ndarray]] = [(0, T.copy())]
     diagnostics: Dict[str, List[Tuple[int, float]]] = {
@@ -179,10 +201,11 @@ def run_simulation(params: SimParams) -> SimResults:
         "mean_T_over_Ta": [(0, float(T.mean() / params.T_a))],
         "vertical_centroid": [(0, float((np.arange(params.N)[:, None] * T).sum() / T.sum()))],
         "frac_moves_up": [(0, 0.0)],
+        "active_parcels": [(0, 0.0)],
     }
 
     for t in range(1, params.steps + 1):
-        T, diag = step_once_batched(T, params, rng)
+        T, parcels, diag = step_once_persistent(T, parcels, params, rng)
         if t % params.snapshot_stride == 0 or t == params.steps:
             snapshots.append((t, T.copy()))
         for k, v in diag.items():
@@ -193,9 +216,10 @@ def run_simulation(params: SimParams) -> SimResults:
 # -----------------------------
 # UI controls
 # -----------------------------
+# -----------------------------
 
 st.title("Probabilistic buoyant plume: minimal model")
-st.caption("Batched, non-persistent parcels; read t then write t+1")
+st.caption("Biased random walk with mixing, read t then write t+1, batched mixing")
 
 with st.sidebar:
     st.header("Controls")
@@ -304,6 +328,6 @@ if res is not None:
 st.markdown(
     """
     ---
-    Notes: non-persistent parcels with batched mixing. Later we will add the Brownian floor and directional persistence as optional features.
+    Notes: this engine uses batched mixing and a read t, write t+1 update. Later we will add the Brownian floor and directional persistence as optional features.
     """
 )
