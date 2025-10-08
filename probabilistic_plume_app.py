@@ -64,9 +64,19 @@ class SimResults:
     diagnostics: Dict[str, List[Tuple[int, float]]]  # time series per metric
     params: SimParams
 
+# -----------------------------
+# Stop flag helper
+# -----------------------------
+
+if "stop_requested" not in st.session_state:
+    st.session_state.stop_requested = False
+
+def request_stop():
+    st.session_state.stop_requested = True
 
 # -----------------------------
 # Core model helpers (persistent engine)
+# ----------------------------- (persistent engine)
 # -----------------------------
 
 def init_grid(params: SimParams) -> np.ndarray:
@@ -179,7 +189,21 @@ def step_once_persistent(T: np.ndarray, parcels: List[Parcel], params: SimParams
     return T_next, final_parcels, diag
 
 
-def run_simulation(params: SimParams) -> SimResults:
+def run_simulation(
+    params: SimParams,
+    *,
+    progress_cb=None,
+    live_update_stride: int = 0,
+    live_placeholder: Optional[st.delta_generator.DeltaGenerator] = None,
+    stop_check=None,
+) -> SimResults:
+    """Run the persistent-parcel simulation.
+
+    progress_cb: callable(step:int, steps:int, diag:dict) -> None
+    live_update_stride: every n steps, draw a live heatmap into live_placeholder (0 disables)
+    live_placeholder: st.empty() container to render live frames
+    stop_check: callable() -> bool, if True at a step, break early
+    """
     rng = np.random.default_rng(params.seed)
     T = init_grid(params)
     parcels: List[Parcel] = []
@@ -193,25 +217,31 @@ def run_simulation(params: SimParams) -> SimResults:
         "active_parcels": [(0, 0.0)],
     }
 
-    # Progress bar and status text
-    prog = st.progress(0, text="Starting simulation…")
-    status = st.empty()
-
     for t in range(1, params.steps + 1):
+        # Stop request check
+        if stop_check is not None and stop_check():
+            break
+
         T, parcels, diag = step_once_persistent(T, parcels, params, rng)
         if t % params.snapshot_stride == 0 or t == params.steps:
             snapshots.append((t, T.copy()))
         for k, v in diag.items():
             diagnostics.setdefault(k, []).append((t, v))
 
-        # Update progress each step
-        pct = int(100 * t / params.steps)
-        status_text = f"Step {t}/{params.steps} · active parcels={int(diag['active_parcels'])} · frac_up={diag['frac_moves_up']:.2f}"
-        prog.progress(pct, text=status_text)
-        status.write(status_text)
+        # Progress callback
+        if progress_cb is not None:
+            progress_cb(t, params.steps, diag)
 
-    # Clear progress when done
-    prog.empty()
+        # Live update frame
+        if live_update_stride and live_placeholder is not None and (t % live_update_stride == 0):
+            try:
+                import matplotlib.pyplot as plt
+                fig_live, ax_live = plt.subplots(figsize=(5, 5))
+                im = ax_live.imshow(T / params.T_a, origin="lower", interpolation="nearest")
+                ax_live.set_title(f"Live field at t = {t}")
+                live_placeholder.pyplot(fig_live, clear_figure=True)
+            except Exception:
+                pass
 
     return SimResults(T=T, snapshots=snapshots, diagnostics=diagnostics, params=params)
 
@@ -234,6 +264,14 @@ with st.sidebar:
     seed = st.number_input("Random seed", min_value=0, value=42)
     snapshot_stride = st.number_input("Snapshot stride", min_value=1, value=10)
 
+    st.markdown("---")
+    live_update_stride = st.number_input(
+        "Live update every n steps",
+        min_value=0,
+        value=10,
+        help="0 disables live plotting during a run"
+    )
+    stop_btn = st.button("Stop", on_click=request_stop)
     run_btn = st.button("Run simulation", type="primary")
 
 # Store params in session state for reproducibility and reruns
@@ -243,14 +281,41 @@ if "results" not in st.session_state:
     st.session_state.results = None
 
 if run_btn:
+    # Reset stop flag at the start of a run
+    st.session_state.stop_requested = False
+
     params = SimParams(
         N=int(N), T_a=float(T_a), k=float(k), alpha=float(alpha),
         steps=int(steps), parcels_per_step=int(parcels_per_step),
         seed=int(seed), snapshot_stride=int(snapshot_stride)
     )
     st.session_state.params = params
+
+    # Progress UI
+    prog = st.progress(0, text="Starting simulation…")
+    status = st.empty()
+    live_placeholder = st.empty() if live_update_stride else None
+
+    def progress_cb(t, total, diag):
+        pct = int(100 * t / total)
+        txt = f"Step {t}/{total} · active parcels={int(diag['active_parcels'])} · frac_up={diag['frac_moves_up']:.2f}"
+        prog.progress(pct, text=txt)
+        status.write(txt)
+
+    def stop_check():
+        return st.session_state.stop_requested
+
     with st.spinner("Running simulation..."):
-        st.session_state.results = run_simulation(params)
+        st.session_state.results = run_simulation(
+            params,
+            progress_cb=progress_cb,
+            live_update_stride=int(live_update_stride),
+            live_placeholder=live_placeholder,
+            stop_check=stop_check,
+        )
+
+    # Clear progress when done
+    prog.empty()
 
 # -----------------------------
 # Visuals
@@ -268,11 +333,14 @@ else:
     if not HAVE_MPL:
         st.error("Matplotlib is required for plots. Install it via requirements.txt.")
     else:
-        # Heatmap of the latest snapshot
-        t_last, T_last = res.snapshots[-1]
+        # Post-run snapshot slider for animation/scrubbing
+        snap_labels = [t for t, _ in res.snapshots]
+        sel = st.slider("View snapshot", 0, len(res.snapshots) - 1, len(res.snapshots) - 1)
+        t_sel, T_sel = res.snapshots[sel]
+
         fig1, ax1 = plt.subplots(figsize=(6, 6))
-        im = ax1.imshow(T_last / res.params.T_a, origin="lower", interpolation="nearest")
-        ax1.set_title(f"Field at t = {t_last} (T/T_a)")
+        im = ax1.imshow(T_sel / res.params.T_a, origin="lower", interpolation="nearest")
+        ax1.set_title(f"Field at t = {t_sel} (T/T_a)")
         ax1.set_xlabel("x index")
         ax1.set_ylabel("y index")
         plt.colorbar(im, ax=ax1, fraction=0.046, pad=0.04, label="T/T_a")
