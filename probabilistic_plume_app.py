@@ -169,8 +169,10 @@ def compute_flux_weights(T_particle: float, T_neighbors: Dict[str, float], *, pa
     # Vertical tilt B
     rel = max(T_particle / max(params.T_a, 1e-12) - 1.0, 0.0)
     V = float(np.exp(params.mu_vertical_tilt * rel))
+
     up_dirs = {"up", "up_left", "up_right"}
     down_dirs = {"down", "down_left", "down_right"}
+    lateral_dirs = {"left", "right"}  # clamp pure lateral when the cell is hot
 
     w: Dict[str, float] = {}
     for d, Tn in T_neighbors.items():
@@ -179,10 +181,14 @@ def compute_flux_weights(T_particle: float, T_neighbors: Dict[str, float], *, pa
         dT = T_particle - Tn
         g = np.exp(lam_eff * dT) - 1.0 if dT > 0 else 0.0
         weight = (eps + g) * P[d] * C.get(d, 1.0)
+
         if d in up_dirs:
             weight *= V
         elif d in down_dirs and V > 0:
             weight /= V
+        elif d in lateral_dirs and V > 0:
+            weight /= V
+
         w[d] = max(0.0, float(weight))
     return w
 
