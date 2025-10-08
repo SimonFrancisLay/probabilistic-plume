@@ -49,23 +49,22 @@ st.set_page_config(
 class SimParams:
     N: int = 99
     T_a: float = 20.0
-    k: float = 5.0  # peak/source multiplier
-    alpha: float = 0.5  # mixing fraction
+    k: float = 5.0            # peak/source multiplier
+    alpha: float = 0.5        # mixing fraction
     steps: int = 200
     parcels_per_step: int = 10
     seed: int = 42
-    snapshot_stride: int = 10  # take a field snapshot every this many steps
+    snapshot_stride: int = 10 # take a field snapshot every this many steps
     # Source scheduling
-    source_mode: str = "Persistent"  # options: Persistent, Grow, Grow-plateau-decay
-    tau_g: float = 20.0  # growth time constant (steps)
-    plateau_steps: int = 50  # plateau duration (steps)
-    tau_d: float = 40.0  # decay time constant (steps)
+    source_mode: str = "Persistent"   # options: Persistent, Grow, Grow-plateau-decay
+    tau_g: float = 20.0               # growth time constant (steps)
+    plateau_steps: int = 50           # plateau duration (steps)
+    tau_d: float = 40.0               # decay time constant (steps)
     # Movement model parameters (exponential ΔT weighting)
     allow_diagonals: bool = True
-    epsilon_baseline: float = 0.005  # small floor to avoid stalling
-    lambda_per_Ta: float = 1.4       # λ is interpreted per T_a: λ_eff = lambda_per_Ta / T_a
+    epsilon_baseline: float = 0.005   # small floor to avoid stalling
+    lambda_per_Ta: float = 1.4        # λ_eff = lambda_per_Ta / T_a
     distance_penalty: bool = True
-   
 
 @dataclass
 class SimResults:
@@ -99,13 +98,21 @@ def init_grid(params: SimParams) -> np.ndarray:
 # IMPORTANT: display uses origin="lower", so increasing row index i moves visually UP.
 # Therefore, define 'up' as (i + 1, j) so that 'up' in the model matches 'up' on the heatmap.
 
-def neighbor_map(i: int, j: int, N: int) -> Dict[str, Optional[Tuple[int, int]]]:
-    return {
+def neighbor_map(i: int, j: int, N: int, allow_diagonals: bool = True) -> Dict[str, Optional[Tuple[int, int]]]:
+    m = {
         "up": (i + 1, j) if i + 1 < N else None,
         "down": (i - 1, j) if i - 1 >= 0 else None,
         "left": (i, j - 1) if j - 1 >= 0 else None,
         "right": (i, j + 1) if j + 1 < N else None,
     }
+    if allow_diagonals:
+        m.update({
+            "up_left": (i + 1, j - 1) if (i + 1 < N and j - 1 >= 0) else None,
+            "up_right": (i + 1, j + 1) if (i + 1 < N and j + 1 < N) else None,
+            "down_left": (i - 1, j - 1) if (i - 1 >= 0 and j - 1 >= 0) else None,
+            "down_right": (i - 1, j + 1) if (i - 1 >= 0 and j + 1 < N) else None,
+        })
+    return m
 
 
 def compute_move_weights_exp(T_particle: float, T_neighbors: Dict[str, float], params: SimParams) -> Dict[str, float]:
@@ -372,7 +379,7 @@ with st.sidebar:
     live_update_stride = st.number_input("Live update every n steps", min_value=0, value=10)
     stop_btn = st.button("Stop", on_click=request_stop)
     run_btn  = st.button("Run simulation", type="primary")
-    
+
 # Store params in session state for reproducibility and reruns
 if "params" not in st.session_state:
     st.session_state.params = None
