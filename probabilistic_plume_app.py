@@ -65,6 +65,8 @@ class SimParams:
     epsilon_baseline: float = 0.005   # small floor to avoid stalling
     lambda_per_Ta: float = 1.4        # λ_eff = lambda_per_Ta / T_a
     distance_penalty: bool = True
+    # Boundary handling
+    boundary_mode: str = "Outflow"  # options: "Blocked", "Periodic", "Reflect", "Outflow"
 
 @dataclass
 class SimResults:
@@ -98,21 +100,41 @@ def init_grid(params: SimParams) -> np.ndarray:
 # IMPORTANT: display uses origin="lower", so increasing row index i moves visually UP.
 # Therefore, define 'up' as (i + 1, j) so that 'up' in the model matches 'up' on the heatmap.
 
-def neighbor_map(i: int, j: int, N: int, allow_diagonals: bool = True) -> Dict[str, Optional[Tuple[int, int]]]:
-    m = {
-        "up": (i + 1, j) if i + 1 < N else None,
-        "down": (i - 1, j) if i - 1 >= 0 else None,
-        "left": (i, j - 1) if j - 1 >= 0 else None,
-        "right": (i, j + 1) if j + 1 < N else None,
+def neighbor_map(
+    i: int, j: int, N: int,
+    allow_diagonals: bool = True,
+    boundary_mode: str = "Outflow"
+) -> Dict[str, Optional[Tuple[int, int]]]:
+    # candidate displacements
+    moves = {
+        "up": (1, 0), "down": (-1, 0), "left": (0, -1), "right": (0, 1)
     }
     if allow_diagonals:
-        m.update({
-            "up_left": (i + 1, j - 1) if (i + 1 < N and j - 1 >= 0) else None,
-            "up_right": (i + 1, j + 1) if (i + 1 < N and j + 1 < N) else None,
-            "down_left": (i - 1, j - 1) if (i - 1 >= 0 and j - 1 >= 0) else None,
-            "down_right": (i - 1, j + 1) if (i - 1 >= 0 and j + 1 < N) else None,
+        moves.update({
+            "up_left": (1, -1), "up_right": (1, 1),
+            "down_left": (-1, -1), "down_right": (-1, 1),
         })
-    return m
+
+    nbrs: Dict[str, Optional[Tuple[int, int]]] = {}
+    for d, (di, dj) in moves.items():
+        ii, jj = i + di, j + dj
+
+        if boundary_mode == "Periodic":
+            # wrap around both axes
+            ii %= N
+            jj %= N
+            nbrs[d] = (ii, jj)
+            continue
+
+        # for Blocked and Outflow we test bounds
+        if 0 <= ii < N and 0 <= jj < N:
+            nbrs[d] = (ii, jj)
+        else:
+            # Blocked: mark as None (unavailable)
+            # Outflow: also mark as None here; we will treat it specially in the move step
+            nbrs[d] = None
+
+    return nbrs
 
 
 def compute_move_weights_exp(T_particle: float, T_neighbors: Dict[str, float], params: SimParams) -> Dict[str, float]:
@@ -181,30 +203,65 @@ def step_once_persistent(T: np.ndarray, parcels: List[Parcel], params: SimParams
     total_moves = 0
 
     new_parcels: List[Parcel] = []
-    for p in parcels:
-        nbrs = neighbor_map(p.i, p.j, N, allow_diagonals=params.allow_diagonals)
-        T_neighbors: Dict[str, float] = {d: T[idx] for d, idx in nbrs.items() if idx is not None}
-        weights = compute_move_weights_exp(p.T, T_neighbors, params)
-        dirs = list(weights.keys())
-        probs = np.array([weights[d] for d in dirs], dtype=np.float64)
-        s = probs.sum()
-        if s <= 0:
-            di, dj = p.i, p.j
-            chosen_dir = "stay"
-        else:
-            probs /= s
-            choice = rng.choice(len(dirs), p=probs)
-            chosen_dir = dirs[choice]
-            if chosen_dir == "stay":
-                di, dj = p.i, p.j
-            else:
-                di, dj = nbrs[chosen_dir]
-                total_moves += 1
-                if chosen_dir.startswith("up"):
-                    moved_up += 1
+    # before loop: keep a list to rebuild only the parcels that stay in-domain
+new_parcels: List[Parcel] = []
 
+for p in parcels:
+    nbrs = neighbor_map(p.i, p.j, N,
+                        allow_diagonals=params.allow_diagonals,
+                        boundary_mode=params.boundary_mode)
+
+    # Build T_neighbors from in-bounds entries only
+    T_neighbors: Dict[str, float] = {d: T[idx] for d, idx in nbrs.items() if idx is not None}
+
+    # If Outflow: add synthetic neighbours for off-grid directions using ambient T_a
+    out_dirs = [d for d, idx in nbrs.items() if idx is None]
+    if params.boundary_mode == "Outflow":
+        for d in out_dirs:
+            # treat outside as ambient to compute ΔT; we will handle removal after choosing
+            T_neighbors[d] = params.T_a
+
+    # Compute weights
+    weights = compute_move_weights_exp(p.T, T_neighbors, params)
+
+    # Normalise
+    dirs = list(weights.keys())
+    probs = np.array([weights[d] for d in dirs], dtype=np.float64)
+    s = probs.sum()
+    if s <= 0:
+        chosen_dir = "stay"
+    else:
+        probs /= s
+        choice = rng.choice(len(dirs), p=probs)
+        chosen_dir = dirs[choice]
+
+    # Resolve destination
+    if chosen_dir == "stay":
+        di, dj = p.i, p.j
         arrivals_T[di][dj].append(p.T)
         new_parcels.append(Parcel(di, dj, p.T))
+        continue
+
+    dest = nbrs.get(chosen_dir, None)
+
+    if dest is None:
+        # Off-grid direction chosen
+        if params.boundary_mode == "Outflow":
+            # parcel leaves the domain: do not add to arrivals, do not keep parcel
+            total_moves += 1
+            # optional: track an outflow counter if you wish for diagnostics
+            continue
+        else:
+            # Blocked: treat as 'stay'
+            di, dj = p.i, p.j
+    else:
+        di, dj = dest
+        total_moves += 1
+        if chosen_dir.startswith("up"):
+            moved_up += 1
+
+    arrivals_T[di][dj].append(p.T)
+    new_parcels.append(Parcel(di, dj, p.T))
 
     # Apply mixing at destinations to produce T_next and update parcel temps
     T_next = T.copy()
@@ -370,6 +427,13 @@ with st.sidebar:
     lambda_per_Ta    = st.slider("ΔT sensitivity λ (per T_a)", 0.0, 3.0, 1.4, step=0.05)
     distance_penalty = st.checkbox("Distance penalty for diagonals (1/√2)", value=True)
 
+    boundary_mode = st.selectbox(
+        "Boundary mode",
+        ["Outflow", "Blocked", "Periodic"],
+        index=0,
+        help="Outflow removes parcels that step out; Blocked ignores off-grid moves; Periodic wraps around"
+    )
+
     steps            = st.number_input("Time steps", min_value=1, value=200)
     parcels_per_step = st.number_input("Parcels per step r", min_value=1, value=10)
     seed             = st.number_input("Random seed", min_value=0, value=42)
@@ -397,6 +461,7 @@ if run_btn:
         source_mode=str(source_mode), tau_g=float(tau_g), plateau_steps=int(plateau_steps), tau_d=float(tau_d),
         allow_diagonals=bool(allow_diagonals), epsilon_baseline=float(epsilon_baseline),
         lambda_per_Ta=float(lambda_per_Ta), distance_penalty=bool(distance_penalty)
+        boundary_mode=str(boundary_mode),
     )
     st.session_state.params = params
 
