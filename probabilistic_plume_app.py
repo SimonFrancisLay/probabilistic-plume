@@ -369,6 +369,40 @@ def run_simulation(
 
     return SimResults(T=T, snapshots=snapshots, diagnostics=diagnostics, params=params)
 
+def compute_default_barrier(N: int) -> tuple[int, int, int, int]:
+    """
+    Default rectangular barrier based on N.
+    Vertically: centred halfway between centre and top, thickness = 5 percent of N (at least 1).
+    Horizontally: spans from 1/4 to 2/3 of the width.
+    Returns (y0, y1, x0, x1), clamped to grid.
+    """
+    if N <= 0:
+        return 0, 0, 0, 0
+
+    centre = N // 2
+    top = N - 1
+    # halfway from centre to top
+    centre_to_top_mid = int(round((centre + top) / 2))
+
+    thickness = max(1, int(round(0.05 * N)))
+    y0 = centre_to_top_mid - thickness // 2
+    y1 = y0 + thickness - 1
+
+    # clamp to grid
+    y0 = max(0, min(N - 1, y0))
+    y1 = max(0, min(N - 1, y1))
+    if y1 < y0:
+        y1 = y0
+
+    x0 = int(round(0.25 * (N - 1)))
+    x1 = int(round((2.0 / 3.0) * (N - 1)))
+    x0 = max(0, min(N - 1, x0))
+    x1 = max(0, min(N - 1, x1))
+    if x1 < x0:
+        x1 = x0
+
+    return y0, y1, x0, x1
+
 # ---
 # Legacy parcel engine kept for reference, not used now
 #
