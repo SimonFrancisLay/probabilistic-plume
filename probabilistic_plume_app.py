@@ -1,7 +1,7 @@
 """
 Probabilistic plume model, Streamlit app
 Persistent parcels, exponential dT movement with optional diagonals, scheduled source profiles,
-live progress and updates, snapshot slider, and configurable boundary modes.
+live progress and updates, snapshot slider, configurable boundary modes, and an optional adiabatic barrier.
 
 Run locally:
 1) pip install -r requirements.txt
@@ -69,6 +69,11 @@ class SimParams:
     distance_penalty: bool = True    # multiply diagonal weights by 1/sqrt(2)
     # Boundary handling
     boundary_mode: str = "Outflow"   # options: Outflow, Blocked, Periodic
+    # Adiabatic barrier
+    barrier_enabled: bool = False
+    barrier_row: int = 60            # row index i (0..N-1), origin lower so larger is higher
+    barrier_x0: int = 20             # inclusive column start j
+    barrier_x1: int = 80             # inclusive column end j
 
 
 @dataclass
@@ -100,7 +105,7 @@ def init_grid(params: SimParams) -> np.ndarray:
     T[c, c] = params.k * params.T_a
     return T
 
-# Display uses origin="lower", so increasing row index i moves visually up.
+# Display uses origin lower, so increasing row index i moves visually up.
 # Define up as (i + 1, j) so that up in the model matches the heatmap.
 
 def neighbor_map(
@@ -191,7 +196,6 @@ def source_multiplier(t: int, p: SimParams) -> float:
         return 1.0 + (p.k - 1.0) * (1.0 - math.exp(-max(t, 0) / max(p.tau_g, 1e-9)))
     # Grow, plateau, decay
     s_grow = 1.0 + (p.k - 1.0) * (1.0 - math.exp(-max(t, 0) / max(p.tau_g, 1e-9)))
-    # plateau start when within 99 percent of k
     if p.k <= 1.0:
         t_plateau_start = 0
     else:
@@ -206,17 +210,38 @@ def source_multiplier(t: int, p: SimParams) -> float:
     return 1.0 + (p.k - 1.0) * math.exp(-(t - t_plateau_end) / td)
 
 
+def build_barrier_mask(N: int, p: SimParams) -> Optional[np.ndarray]:
+    """Return a boolean mask of shape (N, N) where True marks adiabatic barrier cells.
+    If disabled or invalid range, return None.
+    """
+    if not p.barrier_enabled:
+        return None
+    r = int(np.clip(p.barrier_row, 0, N - 1))
+    x0 = int(min(max(p.barrier_x0, 0), N - 1))
+    x1 = int(min(max(p.barrier_x1, 0), N - 1))
+    if x1 < x0:
+        x0, x1 = x1, x0
+    mask = np.zeros((N, N), dtype=bool)
+    mask[r, x0:x1 + 1] = True
+    return mask
+
+
 def step_once_persistent(
     T: np.ndarray,
     parcels: List[Parcel],
     params: SimParams,
     rng: np.random.Generator,
     T_source: float,
+    barrier_mask: Optional[np.ndarray] = None,
 ) -> Tuple[np.ndarray, List[Parcel], Dict[str, float]]:
     N = params.N
     c = N // 2
 
     # Clamp source cell and inject r new parcels
+    if barrier_mask is not None and barrier_mask[c, c]:
+        st.warning("Barrier overlaps the source cell; source cell will be exempt from the barrier.")
+        barrier_mask = barrier_mask.copy()
+        barrier_mask[c, c] = False
     T[c, c] = T_source
     for _ in range(params.parcels_per_step):
         parcels.append(Parcel(c, c, T_source))
@@ -234,8 +259,15 @@ def step_once_persistent(
             allow_diagonals=params.allow_diagonals,
             boundary_mode=params.boundary_mode,
         )
-        # Build temperature map from in-bounds neighbours
-        T_neighbors: Dict[str, float] = {d: T[idx] for d, idx in nbrs.items() if idx is not None}
+        # Build temperature map from in-bounds neighbours, skipping barrier cells
+        T_neighbors: Dict[str, float] = {}
+        for d, idx in nbrs.items():
+            if idx is None:
+                continue
+            ii, jj = idx
+            if barrier_mask is not None and barrier_mask[ii, jj]:
+                continue
+            T_neighbors[d] = T[ii, jj]
         # For Outflow, create synthetic neighbours for off-grid directions using ambient
         if params.boundary_mode == "Outflow":
             for d, idx in nbrs.items():
@@ -260,11 +292,14 @@ def step_once_persistent(
             continue
 
         dest = nbrs.get(chosen_dir, None)
+        # If destination is a barrier cell, treat as blocked
+        if dest is not None and barrier_mask is not None and barrier_mask[dest[0], dest[1]]:
+            dest = None
+
         if dest is None:
             if params.boundary_mode == "Outflow":
                 # Parcel leaves the domain
                 total_moves += 1
-                # optionally count outflow here
                 continue
             else:
                 # Blocked: treat as stay
@@ -280,9 +315,12 @@ def step_once_persistent(
 
     # Mix arrivals to produce T_next and update parcel temperatures
     T_next = T.copy()
-    # Enforce adiabatic barrier later during mixing
     for di in range(N):
         for dj in range(N):
+            if barrier_mask is not None and barrier_mask[di, dj]:
+                # adiabatic barrier holds ambient and ignores arrivals
+                T_next[di, dj] = params.T_a
+                continue
             if arrivals_T[di][dj]:
                 T_cell = T_next[di][dj]
                 for Tin in arrivals_T[di][dj]:
@@ -322,6 +360,9 @@ def run_simulation(
     T = init_grid(params)
     parcels: List[Parcel] = []
 
+    # Build adiabatic barrier mask once per run
+    barrier_mask = build_barrier_mask(params.N, params)
+
     snapshots: List[Tuple[int, np.ndarray]] = [(0, T.copy())]
     diagnostics: Dict[str, List[Tuple[int, float]]] = {
         "max_T_over_Ta": [(0, float(T.max() / params.T_a))],
@@ -336,7 +377,7 @@ def run_simulation(
             break
 
         T_source = source_multiplier(t, params) * params.T_a
-        T, parcels, diag = step_once_persistent(T, parcels, params, rng, T_source)
+        T, parcels, diag = step_once_persistent(T, parcels, params, rng, T_source, barrier_mask)
 
         if t % params.snapshot_stride == 0 or t == params.steps:
             snapshots.append((t, T.copy()))
@@ -349,7 +390,7 @@ def run_simulation(
         if live_update_stride and live_placeholder is not None and (t % live_update_stride == 0):
             try:
                 fig_live, ax_live = plt.subplots(figsize=(5, 5))
-                im = ax_live.imshow(T / params.T_a, origin="lower", interpolation="nearest")
+                ax_live.imshow(T / params.T_a, origin="lower", interpolation="nearest")
                 ax_live.set_title(f"Live field at t = {t}")
                 live_placeholder.pyplot(fig_live, clear_figure=True)
                 plt.close(fig_live)
@@ -363,7 +404,7 @@ def run_simulation(
 # -----------------------------
 
 st.title("Probabilistic buoyant plume: minimal model")
-st.caption("Persistent parcels with scheduled source and exponential dT movement; no background diffusion")
+st.caption("Persistent parcels with scheduled source and exponential dT movement. No background diffusion.")
 
 with st.sidebar:
     st.header("Controls")
@@ -389,6 +430,12 @@ with st.sidebar:
     distance_penalty = st.checkbox("Distance penalty for diagonals (1/sqrt(2))", value=True)
 
     boundary_mode = st.selectbox("Boundary mode", ["Outflow", "Blocked", "Periodic"], index=0, help="Outflow removes parcels that step out; Blocked ignores off-grid moves; Periodic wraps around")
+
+    st.subheader("Adiabatic barrier")
+    barrier_enabled = st.checkbox("Enable horizontal barrier", value=False, help="Internal cells that do not receive heat and cannot be entered")
+    barrier_row = st.number_input("Barrier row i (0=bottom)", min_value=0, max_value=int(N-1), value=min(int(N//2)+10, int(N-1)))
+    barrier_x0 = st.number_input("Barrier start j", min_value=0, max_value=int(N-1), value=20)
+    barrier_x1 = st.number_input("Barrier end j", min_value=0, max_value=int(N-1), value=int(N-20))
 
     steps            = st.number_input("Time steps", min_value=1, value=200)
     parcels_per_step = st.number_input("Parcels per step r", min_value=1, value=10)
@@ -418,6 +465,7 @@ if run_btn:
         allow_diagonals=bool(allow_diagonals), epsilon_baseline=float(epsilon_baseline),
         lambda_per_Ta=float(lambda_per_Ta), distance_penalty=bool(distance_penalty),
         boundary_mode=str(boundary_mode),
+        barrier_enabled=bool(barrier_enabled), barrier_row=int(barrier_row), barrier_x0=int(barrier_x0), barrier_x1=int(barrier_x1),
     )
     st.session_state.params = params
 
@@ -531,6 +579,6 @@ if res is not None:
 st.markdown(
     """
     ---
-    Notes: persistent parcels with scheduled source options (persistent, grow, grow plateau decay) and exponential dT movement with optional diagonals. No global diffusion in this version.
+    Notes: persistent parcels with scheduled source options (persistent, grow, grow plateau decay) and exponential dT movement with optional diagonals. No global diffusion in this version. Supports Outflow, Blocked, or Periodic boundaries, plus an optional adiabatic horizontal barrier.
     """
 )
