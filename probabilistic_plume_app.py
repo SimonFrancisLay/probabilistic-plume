@@ -589,8 +589,8 @@ with st.sidebar:
         "Background diffusion ε",
         min_value=0.0, max_value=0.2, value=0.02, step=0.005,
         help="Moore-neighbour mixing per step. Set to 0 to disable."
-    )", min_value=0.3, max_value=2.0, value=1.0, step=0.1, help="Less than 1 brightens warm regions, greater than 1 compresses highlights")
-
+    )
+    
     steps            = st.number_input("Time steps", min_value=1, value=200)
     parcels_per_step = st.number_input("Parcels per step r", min_value=1, value=10)
     seed             = st.number_input("Random seed", min_value=0, value=42)
