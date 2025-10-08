@@ -280,6 +280,7 @@ def step_once_persistent(
 
     # Mix arrivals to produce T_next and update parcel temperatures
     T_next = T.copy()
+    # Enforce adiabatic barrier later during mixing
     for di in range(N):
         for dj in range(N):
             if arrivals_T[di][dj]:
