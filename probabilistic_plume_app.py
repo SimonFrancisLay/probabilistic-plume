@@ -417,8 +417,16 @@ def run_simulation(
         if live_update_stride and live_placeholder is not None and (t % live_update_stride == 0):
             try:
                 fig_live, ax_live = plt.subplots(figsize=(5, 5))
-                ax_live.imshow(T / params.T_a, origin="lower", interpolation="nearest")
-                ax_live.set_title(f"Live field at t = {t}")
+                im = ax_live.imshow(
+                    T / params.T_a,
+                    origin="lower",
+                    interpolation="nearest",
+                    cmap="inferno",
+                    vmin=1.0,
+                    vmax=params.k,
+                )
+                ax_live.set_title(f"Live field at t = {t}  (T/Tₐ fixed scale)")
+                plt.colorbar(im, ax=ax_live, fraction=0.046, pad=0.04, label="T/Tₐ")
                 live_placeholder.pyplot(fig_live, clear_figure=True)
                 plt.close(fig_live)
             except Exception:
