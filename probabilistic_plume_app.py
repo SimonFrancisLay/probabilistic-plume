@@ -15,7 +15,7 @@ Features
   up: ×V, up-diagonals: ×0.7 V, down and lateral: ÷V, where V = exp(mu * max(T/T_a - 1, 0))
 - Source schedules and a centered source strip one cell tall, spanning a percent of width
 - Boundary modes: Outflow, Blocked, Periodic
-- Rectangular adiabatic barrier mask
+- Rectangular adiabatic barrier mask white
 - Optional background diffusion after stochastic transfer
 - Progress bar, live updates, snapshots, diagnostics, export
 
