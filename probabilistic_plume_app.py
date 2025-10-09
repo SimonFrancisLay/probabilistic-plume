@@ -4,6 +4,11 @@ Stochastic token flux engine with A/B sampling toggle:
 A) Per token categorical sampling
 B) Single-step multinomial allocation
 
+Now hardened for large grids and hot cores:
+- Overflow safe exponentials in weight and tilt calculations
+- Probability vectors sanitised before sampling
+- Fixed colour scale in live and snapshot views (T/T_a from 1 to k)
+
 Features
 - Exponential dT weighting with directional priors and distance penalty
 - Temperature dependent vertical tilt with lateral clamp
@@ -165,26 +170,35 @@ def _distance_penalty(p: SimParams) -> Dict[str, float]:
 
 
 def compute_flux_weights(Tp: float, Tn: Dict[str, float], *, params: SimParams) -> Dict[str, float]:
-    """Directional weights. Up gets ×V, up-diagonals ×0.7 V, down and lateral ÷V."""
+    """Directional weights, overflow safe.
+    Up ×V, up-diagonals ×0.7 V, down and lateral ÷V. Uses expm1 and clamps exponent args.
+    """
     eps = max(0.0, params.epsilon_baseline)
     lam_eff = params.lambda_per_Ta / max(params.T_a, 1e-12)
+
+    # Vertical tilt with clamp
+    rel = max(Tp / max(params.T_a, 1e-12) - 1.0, 0.0)
+    tilt_arg = np.clip(params.mu_vertical_tilt * rel, 0.0, 50.0)
+    V = float(np.exp(tilt_arg))
+
     P = _direction_priors(Tp, params)
     C = _distance_penalty(params)
 
-    rel = max(Tp / max(params.T_a, 1e-12) - 1.0, 0.0)
-    V = float(np.exp(params.mu_vertical_tilt * rel))
-    up_dirs = {"up"}
-    up_diag_dirs = {"up_left", "up_right"}
-    down_dirs = {"down", "down_left", "down_right"}
-    lateral_dirs = {"left", "right"}
+    up_dirs       = {"up"}
+    up_diag_dirs  = {"up_left", "up_right"}
+    down_dirs     = {"down", "down_left", "down_right"}
+    lateral_dirs  = {"left", "right"}
 
     w: Dict[str, float] = {}
     for d, Tdj in Tn.items():
         if d not in P:
             continue
         dT = Tp - Tdj
-        g = np.exp(lam_eff * dT) - 1.0 if dT > 0 else 0.0
+        # Only positive gradient contributes
+        arg = np.clip(lam_eff * max(dT, 0.0), 0.0, 50.0)
+        g = np.expm1(arg)  # stable exp(arg) - 1
         weight = (eps + g) * P[d] * C.get(d, 1.0)
+
         if d in up_dirs:
             weight *= V
         elif d in up_diag_dirs:
@@ -193,7 +207,10 @@ def compute_flux_weights(Tp: float, Tn: Dict[str, float], *, params: SimParams) 
             weight /= V
         elif d in lateral_dirs and V > 0:
             weight /= V
-        w[d] = max(0.0, float(weight))
+
+        if not np.isfinite(weight) or weight < 0.0:
+            weight = 0.0
+        w[d] = float(weight)
     return w
 
 # =============================
@@ -291,8 +308,8 @@ def stochastic_flux_step(T: np.ndarray, *, params: SimParams, barrier_mask: Opti
                 continue
             Tij = T[i, j]
             Xij = max(Tij - params.T_a, 0.0)
-            E = Xij  # exported heat; q controls effective step. To add explicit beta, use: E = beta * Xij
-            # We evaluate even if Xij == 0 to keep the scheme general
+            E = Xij  # exported heat; q controls effective step size
+            # Evaluate every cell, even if Xij is zero, to keep scheme general
             if E <= 0.0:
                 continue
 
@@ -313,11 +330,21 @@ def stochastic_flux_step(T: np.ndarray, *, params: SimParams, barrier_mask: Opti
                 continue
 
             w = compute_flux_weights(Tij, Tn, params=params)
-            s = sum(w.values())
+
+            # Build dirs and raw weights, sanitise
+            dirs = list(w.keys())
+            raw = np.array([w[d] for d in dirs], dtype=np.float64)
+            raw[~np.isfinite(raw)] = 0.0
+            raw[raw < 0.0] = 0.0
+            s = raw.sum()
             if s <= 0.0:
                 continue
-            dirs = list(w.keys())
-            pvec = np.array([w[d] / s for d in dirs], dtype=np.float64)
+            pvec = raw / s
+            pvec = np.clip(pvec, 0.0, 1.0)
+            sum_p = pvec.sum()
+            if not np.isfinite(sum_p) or sum_p <= 0.0:
+                continue
+            pvec /= sum_p
 
             n_float = E / q
             n_base = int(np.floor(n_float))
@@ -426,7 +453,7 @@ def run_simulation(
                     vmax=params.k,
                 )
                 ax_live.set_title(f"Live field at t = {t}  (T/Tₐ fixed scale)")
-                plt.colorbar(im, ax=ax_live, fraction=0.046, pad=0.04, label="T/Tₐ")
+                fig_live.colorbar(im, ax=ax_live, fraction=0.046, pad=0.04, label="T/Tₐ")
                 live_placeholder.pyplot(fig_live, clear_figure=True)
                 plt.close(fig_live)
             except Exception:
@@ -467,7 +494,7 @@ def request_stop():
     st.session_state.stop_requested = True
 
 st.title("Probabilistic buoyant plume: stochastic token flux")
-st.caption("Toggle between per token sampling and single-shot multinomial allocation.")
+st.caption("Toggle between per token sampling and single-shot multinomial allocation. Overflow safe and fixed colour scale.")
 
 with st.sidebar:
     st.header("Controls")
@@ -590,14 +617,22 @@ else:
         data = (T_sel / res.params.T_a).copy()
         if barrier_mask_plot is not None:
             data = np.ma.array(data, mask=barrier_mask_plot)
-        cmap = plt.get_cmap(cmap_name).copy(); cmap.set_bad(color="black")
+        cmap = plt.get_cmap(cmap_name).copy(); cmap.set_bad(color="white")
         norm = PowerNorm(gamma=gamma)
 
         fig1, ax1 = plt.subplots(figsize=(6, 6))
-        im = ax1.imshow(data, origin="lower", interpolation="nearest", cmap=cmap, norm=norm)
-        ax1.set_title(f"Field at t = {t_sel} (T/T_a)")
+        im = ax1.imshow(
+            data,
+            origin="lower",
+            interpolation="nearest",
+            cmap=cmap,
+            norm=norm,
+            vmin=1.0,
+            vmax=res.params.k,
+        )
+        ax1.set_title(f"Field at t = {t_sel} (T/Tₐ, fixed scale)")
         ax1.set_xlabel("x index"); ax1.set_ylabel("y index")
-        plt.colorbar(im, ax=ax1, fraction=0.046, pad=0.04, label="T/T_a")
+        fig1.colorbar(im, ax=ax1, fraction=0.046, pad=0.04, label="T/Tₐ")
         with col1:
             st.pyplot(fig1, clear_figure=True)
         plt.close(fig1)
