@@ -478,13 +478,14 @@ def run_simulation(
                 except Exception:
                     pass
 
+                norm_live = PowerNorm(gamma=gamma, vmin=1.0, vmax=params.k)
+
                 im = ax_live.imshow(
                     live_data,
                     origin="lower",
                     interpolation="nearest",
                     cmap=cmap_live,
-                    vmin=1.0,
-                    vmax=params.k,
+                    norm=norm_live,  # limits inside norm, no vmin or vmax here
                 )
                 ax_live.set_title(f"Live field at t = {t}  (T/T_a fixed scale)")
                 fig_live.colorbar(im, ax=ax_live, fraction=0.046, pad=0.04, label="T/T_a")
@@ -652,7 +653,7 @@ else:
         if barrier_mask_plot is not None:
             data = np.ma.array(data, mask=barrier_mask_plot)
         cmap = plt.get_cmap(cmap_name).copy(); cmap.set_bad(color="white")
-        norm = PowerNorm(gamma=gamma)
+        norm = PowerNorm(gamma=gamma, vmin=1.0, vmax=res.params.k)
 
         fig1, ax1 = plt.subplots(figsize=(6, 6))
         im = ax1.imshow(
@@ -660,9 +661,7 @@ else:
             origin="lower",
             interpolation="nearest",
             cmap=cmap,
-            norm=norm,
-            vmin=1.0,
-            vmax=res.params.k,
+            norm=norm,   # limits are inside norm
         )
         ax1.set_title(f"Field at t = {t_sel} (T/T_a, fixed scale)")
         ax1.set_xlabel("x index"); ax1.set_ylabel("y index")
