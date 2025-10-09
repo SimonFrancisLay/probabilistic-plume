@@ -1,12 +1,17 @@
 """
 Probabilistic plume model, Streamlit app
-Flux (conservative) engine with exponential dT weighting, optional diagonals, gravity toggle,
-vertical tilt with lateral clamp, source schedules, boundary modes, rectangular adiabatic barrier,
-background diffusion, progress/live updates, snapshot slider, diagnostics, export, and UI helper refactor.
+Stochastic token flux engine (Method A): each cell exports heat as discrete tokens of size q,
+then for each token we sample a neighbour according to the directional probability weights.
 
-New in this version
-- Source region is a centered square covering configurable percent of total cells (default 5%).
-- Vertical tilt μ also clamps pure lateral moves, tightening plume angle.
+Features kept from prior versions
+- Exponential dT weighting with directional priors and distance penalty
+- Temperature dependent vertical tilt with lateral clamp
+  up: ×V, up-diagonals: ×0.7 V, down and lateral: ÷V, where V = exp(mu * max(T/T_a - 1, 0))
+- Source schedules and a centered source strip one cell tall, spanning a percent of width
+- Boundary modes: Outflow, Blocked, Periodic
+- Rectangular adiabatic barrier mask
+- Background diffusion after the stochastic transfer (optional, small)
+- Progress bar, live updates, snapshots, diagnostics, export
 
 Run locally:
 1) pip install -r requirements.txt
@@ -45,32 +50,30 @@ st.set_page_config(page_title="Probabilistic plume model", page_icon="💨", lay
 class SimParams:
     N: int = 99
     T_a: float = 20.0
-    k: float = 5.0                    # source peak multiplier
-    alpha: float = 0.5                # optional post-flux smoothing (not used by default)
+    k: float = 5.0
     steps: int = 200
-    parcels_per_step: int = 10        # legacy (unused by flux engine)
     seed: int = 42
     snapshot_stride: int = 10
-    # Source scheduling
+    # Source schedule
     source_mode: str = "Persistent"   # Persistent, Grow, Grow-plateau-decay
     tau_g: float = 20.0
     plateau_steps: int = 50
     tau_d: float = 40.0
-    # Source geometry
-    source_area_frac: float = 0.05    # centered square area as fraction of total cells
+    # Source geometry: centered horizontal strip one cell tall
+    source_span_frac: float = 0.05     # percent of width as fraction 0..1
     # Movement model parameters
     allow_diagonals: bool = True
-    epsilon_baseline: float = 0.005   # floor in directional weights
-    lambda_per_Ta: float = 1.4        # λ_eff = lambda_per_Ta / T_a
-    distance_penalty: bool = True     # diagonals get 1/√2 if True
-    disable_gravity: bool = False     # flattens directional priors
-    mu_vertical_tilt: float = 1.0     # strength of temperature dependent vertical tilt
-    # Flux engine control
-    beta_transfer: float = 0.3        # fraction of excess exported per step
+    epsilon_baseline: float = 0.005
+    lambda_per_Ta: float = 1.8        # slightly stronger by default for stochastic
+    distance_penalty: bool = True
+    disable_gravity: bool = False
+    mu_vertical_tilt: float = 1.5
+    # Stochastic token engine
+    eta_token_quanta: float = 1e-3     # token size q = eta * T_a
     # Background diffusion
-    epsilon_diffusion: float = 0.02   # global Moore-neighbour mixing per step
+    epsilon_diffusion: float = 0.01
     # Boundaries
-    boundary_mode: str = "Outflow"    # Outflow, Blocked, Periodic
+    boundary_mode: str = "Outflow"     # Outflow, Blocked, Periodic
     # Adiabatic barrier block
     barrier_enabled: bool = False
     barrier_y0: int = 50
@@ -87,11 +90,10 @@ class SimResults:
     params: SimParams
 
 # =============================
-# Helpers: source schedule, source region, neighbours, weights
+# Helpers: source schedule, source strip, neighbours, weights
 # =============================
 
 def source_multiplier(t: int, p: SimParams) -> float:
-    """Return s(t) so that T_source = s(t) * T_a."""
     import math
     if p.source_mode == "Persistent":
         return p.k
@@ -99,7 +101,6 @@ def source_multiplier(t: int, p: SimParams) -> float:
         return 1.0 + (p.k - 1.0) * (1.0 - math.exp(-max(t, 0) / max(p.tau_g, 1e-9)))
     # Grow-plateau-decay
     s_grow = 1.0 + (p.k - 1.0) * (1.0 - math.exp(-max(t, 0) / max(p.tau_g, 1e-9)))
-    # Heuristic plateau start: when growth reaches ~99% of k
     t_star = 0 if p.k <= 1.0 else int(max(0.0, np.ceil(-p.tau_g * np.log(max(1e-9, (p.k - 1.0) * 0.01 / max(p.k - 1.0, 1e-9))))))
     t_plateau_end = t_star + int(max(0, p.plateau_steps))
     if t < t_star:
@@ -109,22 +110,15 @@ def source_multiplier(t: int, p: SimParams) -> float:
     return 1.0 + (p.k - 1.0) * np.exp(-(t - t_plateau_end) / max(p.tau_d, 1e-9))
 
 
-
-# NEW:
 def source_region_coords(N: int, frac: float) -> Tuple[int, int, int, int]:
-    """
-    Return (y0, y1, x0, x1) for a centered HORIZONTAL STRIP one-cell tall,
-    with length ≈ frac * N. Ensures at least 1 cell, clamps to grid,
-    and uses an odd length so the strip is symmetric about the centre.
-    """
+    """Centered horizontal strip one cell tall, spanning about frac * N columns."""
     frac = float(np.clip(frac, 0.0, 1.0))
-    c = N // 2  # centre row and col
-    # desired span in columns
+    c = N // 2
     span = max(1, int(round(frac * N)))
     if span % 2 == 0:
-        span = min(span + 1, N)  # keep odd so it centers on c
+        span = min(span + 1, N)
     half = span // 2
-    y0 = y1 = c                  # one cell deep in the vertical
+    y0 = y1 = c
     x0 = max(0, c - half)
     x1 = min(N - 1, c + half)
     return y0, y1, x0, x1
@@ -133,11 +127,11 @@ def source_region_coords(N: int, frac: float) -> Tuple[int, int, int, int]:
 def init_grid(params: SimParams) -> np.ndarray:
     N = params.N
     T = np.full((N, N), params.T_a, dtype=np.float64)
-    y0, y1, x0, x1 = source_region_coords(N, params.source_area_frac)
+    y0, y1, x0, x1 = source_region_coords(N, params.source_span_frac)
     T[y0:y1+1, x0:x1+1] = params.k * params.T_a
     return T
 
-# origin="lower": increasing i is visually up
+# origin lower: increasing i is visually up
 
 def neighbor_map(i: int, j: int, N: int, *, allow_diagonals: bool, boundary_mode: str) -> Dict[str, Optional[Tuple[int, int]]]:
     moves = {"up": (1, 0), "down": (-1, 0), "left": (0, -1), "right": (0, 1)}
@@ -155,66 +149,48 @@ def neighbor_map(i: int, j: int, N: int, *, allow_diagonals: bool, boundary_mode
     return nbrs
 
 
-def _direction_priors(T_particle: float, params: SimParams) -> Dict[str, float]:
-    if params.disable_gravity:
+def _direction_priors(Tp: float, p: SimParams) -> Dict[str, float]:
+    if p.disable_gravity:
         base = 1.0
-        return {
-            "up": base, "up_left": base, "up_right": base,
-            "left": base, "right": base,
-            "down": base, "down_left": base, "down_right": base,
-        }
-    b = T_particle / params.T_a
-    return {
-        "up": b,
-        "up_left": 0.7 * b, "up_right": 0.7 * b,
-        "left": 0.5, "right": 0.5,
-        "down": 0.2, "down_left": 0.1, "down_right": 0.1,  # reduced down priors
-    }
+        return {"up": base, "up_left": base, "up_right": base, "left": base, "right": base, "down": base, "down_left": base, "down_right": base}
+    b = Tp / p.T_a
+    return {"up": b, "up_left": 0.7 * b, "up_right": 0.7 * b, "left": 0.5, "right": 0.5, "down": 0.2, "down_left": 0.1, "down_right": 0.1}
 
 
-def _distance_penalty(params: SimParams) -> Dict[str, float]:
-    diag = (1.0 / np.sqrt(2)) if params.distance_penalty else 1.0
-    return {
-        "up": 1.0, "down": 1.0, "left": 1.0, "right": 1.0,
-        "up_left": diag, "up_right": diag, "down_left": diag, "down_right": diag,
-    }
+def _distance_penalty(p: SimParams) -> Dict[str, float]:
+    diag = (1.0 / np.sqrt(2)) if p.distance_penalty else 1.0
+    return {"up": 1.0, "down": 1.0, "left": 1.0, "right": 1.0, "up_left": diag, "up_right": diag, "down_left": diag, "down_right": diag}
 
 
-def compute_flux_weights(T_particle: float, T_neighbors: Dict[str, float], *, params: SimParams) -> Dict[str, float]:
-    """Weights for directional flux out of a cell.
-    Exponential ΔT term, directional priors, diagonal penalty, and temperature dependent vertical tilt V(T).
-    Up directions × V, down and lateral directions ÷ V, where V = exp(mu * max(T/T_a - 1, 0)).
-    """
+def compute_flux_weights(Tp: float, Tn: Dict[str, float], *, params: SimParams) -> Dict[str, float]:
+    """Directional weights. Up gets ×V, up-diagonals ×0.7 V, down and lateral ÷V."""
     eps = max(0.0, params.epsilon_baseline)
     lam_eff = params.lambda_per_Ta / max(params.T_a, 1e-12)
-    P = _direction_priors(T_particle, params)
+    P = _direction_priors(Tp, params)
     C = _distance_penalty(params)
 
-    # Vertical tilt B with lateral clamp
-    rel = max(T_particle / max(params.T_a, 1e-12) - 1.0, 0.0)
+    rel = max(Tp / max(params.T_a, 1e-12) - 1.0, 0.0)
     V = float(np.exp(params.mu_vertical_tilt * rel))
-    up_dirs = {"up", "up_left", "up_right"}
+    up_dirs = {"up"}
+    up_diag_dirs = {"up_left", "up_right"}
     down_dirs = {"down", "down_left", "down_right"}
     lateral_dirs = {"left", "right"}
 
     w: Dict[str, float] = {}
-    for d, Tn in T_neighbors.items():
+    for d, Tdj in Tn.items():
         if d not in P:
             continue
-        dT = T_particle - Tn
+        dT = Tp - Tdj
         g = np.exp(lam_eff * dT) - 1.0 if dT > 0 else 0.0
         weight = (eps + g) * P[d] * C.get(d, 1.0)
-
-        # Directional tilt scaling
-        if d == "up":
+        if d in up_dirs:
             weight *= V
-        elif d in {"up_left", "up_right"}:
+        elif d in up_diag_dirs:
             weight *= 0.7 * V
         elif d in down_dirs and V > 0:
             weight /= V
         elif d in lateral_dirs and V > 0:
             weight /= V
-
         w[d] = max(0.0, float(weight))
     return w
 
@@ -223,10 +199,6 @@ def compute_flux_weights(T_particle: float, T_neighbors: Dict[str, float], *, pa
 # =============================
 
 def compute_default_barrier(N: int) -> Tuple[int, int, int, int]:
-    """Default rectangular barrier.
-    Vertically centered halfway between centre and top; thickness = 5 percent of N (>=1).
-    Horizontally spans from quarter to two thirds of width. Returns (y0, y1, x0, x1).
-    """
     if N <= 0:
         return 0, 0, 0, 0
     centre = N // 2
@@ -273,7 +245,7 @@ def build_barrier_mask(N: int, p: SimParams) -> Optional[np.ndarray]:
     return mask
 
 # =============================
-# Diffusion and flux step
+# Background diffusion
 # =============================
 
 def background_diffuse(T: np.ndarray, params: SimParams, barrier_mask: Optional[np.ndarray]) -> np.ndarray:
@@ -298,30 +270,40 @@ def background_diffuse(T: np.ndarray, params: SimParams, barrier_mask: Optional[
         T_new[barrier_mask] = params.T_a
     return T_new
 
+# =============================
+# Stochastic token flux step (Method A)
+# =============================
 
-def flux_step(T: np.ndarray, *, params: SimParams, barrier_mask: Optional[np.ndarray]) -> Tuple[np.ndarray, Dict[str, float]]:
+def stochastic_flux_step(T: np.ndarray, *, params: SimParams, barrier_mask: Optional[np.ndarray], rng: np.random.Generator) -> Tuple[np.ndarray, Dict[str, float]]:
     N = params.N
-    beta = float(params.beta_transfer)
-    outflow = np.zeros_like(T)
-    inflow = np.zeros_like(T)
-    sink_loss = 0.0
+    q = max(1e-12, params.eta_token_quanta * params.T_a)  # token heat
 
+    inflow = np.zeros_like(T)
+    out_tokens = 0
+    sink_tokens = 0
+
+    # We evaluate every cell, even if Xij == 0, to keep the math general as requested
     for i in range(N):
         for j in range(N):
             if barrier_mask is not None and barrier_mask[i, j]:
                 continue
             Tij = T[i, j]
-            Xij = max(Tij - params.T_a, 0.0)  # export only excess over ambient
-            export = beta * Xij
-            if export <= 0.0:
+            Xij = max(Tij - params.T_a, 0.0)
+            # Exported heat this step: beta equivalent via expected tokens
+            # For token model A without beta, the effective beta is q * E[n] / Xij after rounding.
+            # We control export rate implicitly by q. If you prefer an explicit beta, multiply Xij by beta here.
+            E = Xij  # use full excess; smaller q acts like smaller timestep. To mimic beta, set E = beta * Xij.
+            if E <= 0.0:
                 continue
+
+            # Build neighbour list and temperatures
             nbrs = neighbor_map(i, j, N, allow_diagonals=params.allow_diagonals, boundary_mode=params.boundary_mode)
             Tn: Dict[str, float] = {}
             sink_dirs: List[str] = []
             for d, idx in nbrs.items():
                 if idx is None:
                     if params.boundary_mode == "Outflow":
-                        Tn[d] = params.T_a  # use ambient for weight calc
+                        Tn[d] = params.T_a
                         sink_dirs.append(d)
                     continue
                 ii, jj = idx
@@ -330,31 +312,54 @@ def flux_step(T: np.ndarray, *, params: SimParams, barrier_mask: Optional[np.nda
                 Tn[d] = T[ii, jj]
             if not Tn:
                 continue
-            w = compute_flux_weights(Tij, Tn, params=params)
-            total_w = sum(w.values())
-            if total_w <= 0.0:
-                continue
-            for d, wd in w.items():
-                frac = wd / total_w
-                if d in sink_dirs:
-                    sink_loss += export * frac
-                else:
-                    ii, jj = nbrs[d]
-                    inflow[ii, jj] += export * frac
-            outflow[i, j] += export
 
-    T_next = T - outflow + inflow
+            w = compute_flux_weights(Tij, Tn, params=params)
+            s = sum(w.values())
+            if s <= 0.0:
+                continue
+            # Probability vector over available directions only
+            dirs = list(w.keys())
+            pvec = np.array([w[d] / s for d in dirs], dtype=np.float64)
+
+            # Number of tokens from this cell: floor plus fractional Bernoulli
+            n_float = E / q
+            n_base = int(np.floor(n_float))
+            n = n_base + (1 if rng.random() < (n_float - n_base) else 0)
+            if n <= 0:
+                continue
+
+            # Sample n categorical draws in one call
+            choices = rng.choice(len(dirs), size=n, p=pvec)
+            out_tokens += n
+
+            # Accumulate inflow per direction
+            for idx_choice in choices:
+                d = dirs[idx_choice]
+                if d in sink_dirs:
+                    sink_tokens += 1
+                    continue
+                ii, jj = nbrs[d]
+                inflow[ii, jj] += q
+
+            # Remove exported heat from origin
+            T[i, j] = max(params.T_a, T[i, j] - n * q)
+
+    # Apply inflow
+    T_next = T + inflow
+
+    # Barrier enforcement and diffusion
     if barrier_mask is not None:
         T_next[barrier_mask] = params.T_a
     T_next = background_diffuse(T_next, params, barrier_mask)
 
     diag: Dict[str, float] = {}
+    diag["tokens_out"] = float(out_tokens)
+    diag["tokens_sink"] = float(sink_tokens)
     diag["max_T_over_Ta"] = float(T_next.max() / params.T_a)
     diag["mean_T_over_Ta"] = float(T_next.mean() / params.T_a)
     y = np.arange(N, dtype=np.float64)
     weighted_sum = (T_next * y[:, None]).sum(); total_temp = T_next.sum()
     diag["vertical_centroid"] = float(weighted_sum / total_temp) if total_temp > 0 else float(N // 2)
-    diag["sink_loss"] = float(sink_loss)
     return T_next, diag
 
 # =============================
@@ -378,13 +383,9 @@ def run_simulation(
         "max_T_over_Ta": [(0, float(T.max() / params.T_a))],
         "mean_T_over_Ta": [(0, float(T.mean() / params.T_a))],
         "vertical_centroid": [(0, float((np.arange(params.N)[:, None] * T).sum() / max(T.sum(), 1e-12)))],
-        "frac_moves_up": [(0, 0.0)],  # retained names for continuity
-        "active_parcels": [(0, 0.0)],
-        "sink_loss": [(0, 0.0)],
+        "tokens_out": [(0, 0.0)],
+        "tokens_sink": [(0, 0.0)],
     }
-
-    # Centre index for profiles only
-    c = params.N // 2
 
     for t in range(1, params.steps + 1):
         if stop_check is not None and stop_check():
@@ -392,7 +393,7 @@ def run_simulation(
         # Source forcing while hotter than ambient
         T_source = source_multiplier(t, params) * params.T_a
         if T_source > params.T_a + 1e-6:
-            y0, y1, x0, x1 = source_region_coords(params.N, params.source_area_frac)
+            y0, y1, x0, x1 = source_region_coords(params.N, params.source_span_frac)
             if barrier_mask is not None:
                 block = T[y0:y1+1, x0:x1+1]
                 mask_block = barrier_mask[y0:y1+1, x0:x1+1]
@@ -401,7 +402,8 @@ def run_simulation(
             else:
                 T[y0:y1+1, x0:x1+1] = T_source
 
-        T, diag = flux_step(T, params=params, barrier_mask=barrier_mask)
+        T, diag = stochastic_flux_step(T, params=params, barrier_mask=barrier_mask, rng=rng)
+
         if t % params.snapshot_stride == 0 or t == params.steps:
             snapshots.append((t, T.copy()))
         for k, v in diag.items():
@@ -421,58 +423,25 @@ def run_simulation(
     return SimResults(T=T, snapshots=snapshots, diagnostics=diagnostics, params=params)
 
 # =============================
-# UI helper components
+# UI helpers
 # =============================
 
 def barrier_controls(N: int) -> Tuple[bool, int, int, int, int]:
     st.subheader("Adiabatic barrier block")
-    barrier_enabled = st.checkbox(
-        "Enable rectangular barrier",
-        value=False,
-        help="Internal block that does not receive heat and cannot be entered",
-    )
-    y0 = st.number_input(
-        "Barrier bottom row i0 (0=bottom)",
-        min_value=0, max_value=int(N - 1),
-        value=int(st.session_state.barrier_y0),
-    )
-    y1 = st.number_input(
-        "Barrier top row i1",
-        min_value=0, max_value=int(N - 1),
-        value=int(st.session_state.barrier_y1),
-    )
-    x0 = st.number_input(
-        "Barrier left col j0",
-        min_value=0, max_value=int(N - 1),
-        value=int(st.session_state.barrier_x0),
-    )
-    x1 = st.number_input(
-        "Barrier right col j1",
-        min_value=0, max_value=int(N - 1),
-        value=int(st.session_state.barrier_x1),
-    )
+    barrier_enabled = st.checkbox("Enable rectangular barrier", value=False)
+    y0 = st.number_input("Barrier bottom row i0 (0=bottom)", min_value=0, max_value=int(N - 1), value=int(st.session_state.barrier_y0))
+    y1 = st.number_input("Barrier top row i1", min_value=0, max_value=int(N - 1), value=int(st.session_state.barrier_y1))
+    x0 = st.number_input("Barrier left col j0", min_value=0, max_value=int(N - 1), value=int(st.session_state.barrier_x0))
+    x1 = st.number_input("Barrier right col j1", min_value=0, max_value=int(N - 1), value=int(st.session_state.barrier_x1))
     return bool(barrier_enabled), int(y0), int(y1), int(x0), int(x1)
 
 
 def color_and_diffusion_controls() -> Tuple[str, float, float]:
     st.subheader("Color mapping")
-    cmap_name = st.selectbox(
-        "Colormap",
-        ["inferno", "magma", "viridis", "plasma", "cividis"],
-        index=0,
-        help="Perceptually uniform maps give smooth gradation",
-    )
-    gamma = st.slider(
-        "Contrast (gamma)",
-        min_value=0.3, max_value=2.0, value=1.0, step=0.1,
-        help="Less than 1 brightens warm regions; greater than 1 compresses highlights",
-    )
+    cmap_name = st.selectbox("Colormap", ["inferno", "magma", "viridis", "plasma", "cividis"], index=0)
+    gamma = st.slider("Contrast (gamma)", min_value=0.3, max_value=2.0, value=1.0, step=0.1)
     st.subheader("Background diffusion")
-    epsilon_diffusion = st.slider(
-        "Background diffusion ε",
-        min_value=0.0, max_value=0.2, value=0.02, step=0.005,
-        help="Moore neighbour mixing per step. Set to 0 to disable.",
-    )
+    epsilon_diffusion = st.slider("Background diffusion ε", min_value=0.0, max_value=0.2, value=0.01, step=0.005)
     return str(cmap_name), float(gamma), float(epsilon_diffusion)
 
 # =============================
@@ -485,12 +454,12 @@ if "stop_requested" not in st.session_state:
 def request_stop():
     st.session_state.stop_requested = True
 
-st.title("Probabilistic buoyant plume: flux model")
-st.caption("Conservative flux transport with exponential dT weighting, vertical tilt, and extended source region.")
+st.title("Probabilistic buoyant plume: stochastic token flux")
+st.caption("Each cell exports discrete heat tokens to neighbours according to probabilistic weights.")
 
 with st.sidebar:
     st.header("Controls")
-    N   = st.number_input("Grid size N", min_value=21, max_value=401, value=99, step=2, help="Prefer odd so the centre is unique")
+    N   = st.number_input("Grid size N", min_value=21, max_value=401, value=99, step=2)
     T_a = st.number_input("Ambient temperature T_a", min_value=0.1, value=20.0)
     k   = st.number_input("Source peak multiplier k", min_value=1.0, value=5.0)
 
@@ -503,24 +472,26 @@ with st.sidebar:
     with col_s3:
         tau_d = st.number_input("Decay tau (steps)", min_value=1.0, value=40.0)
 
-    source_area_pct = st.slider(
-        "Source area (% of grid width)",
-        min_value=0.5, max_value=25.0, value=5.0, step=0.5,
-        help="The source is a centered square covering this percent of total cells",
+    source_span_pct = st.slider(
+        "Source span (% of width)",
+        min_value=0.5, max_value=50.0, value=5.0, step=0.5,
+        help="Centered horizontal strip, one cell tall, spanning this percent of the grid width",
     )
-
-    alpha = st.slider("Mixing fraction alpha (optional)", 0.0, 1.0, 0.5, help="Only used if you later enable post-flux smoothing")
 
     st.subheader("Movement model")
     allow_diagonals  = st.checkbox("Allow diagonal moves", value=True)
     epsilon_baseline = st.slider("Baseline eps (floor)", 0.0, 0.05, 0.005, step=0.001)
-    lambda_per_Ta    = st.slider("dT sensitivity lambda (per T_a)", 0.0, 3.0, 1.4, step=0.05)
+    lambda_per_Ta    = st.slider("dT sensitivity lambda (per T_a)", 0.0, 3.5, 1.8, step=0.05)
     distance_penalty = st.checkbox("Distance penalty for diagonals (1/sqrt(2))", value=True)
     disable_gravity  = st.checkbox("Disable gravity bias", value=False)
+    mu_vertical_tilt = st.slider("Vertical tilt μ", 0.0, 3.0, 1.5, 0.1)
 
-    st.subheader("Flux transfer")
-    beta_transfer = st.slider("Export fraction per step β", 0.0, 0.8, 0.3, 0.05)
-    mu_vertical_tilt = st.slider("Vertical tilt μ", 0.0, 3.0, 1.0, 0.1, help="Up weights ×V, down/lateral weights ÷V as T rises above T_a")
+    st.subheader("Stochastic tokens")
+    eta_token_quanta = st.select_slider(
+        "Token quantum η (in units of T_a)",
+        options=[1e-4, 2e-4, 5e-4, 1e-3, 2e-3, 5e-3, 1e-2], value=1e-3,
+        help="Token heat is q = η T_a. Smaller η gives more tokens and smoother motion; larger η is chunkier and faster.",
+    )
 
     boundary_mode = st.selectbox("Boundary mode", ["Outflow", "Blocked", "Periodic"], index=0)
 
@@ -530,10 +501,9 @@ with st.sidebar:
 
     cmap_name, gamma, epsilon_diffusion = color_and_diffusion_controls()
 
-    steps            = st.number_input("Time steps", min_value=1, value=200)
-    parcels_per_step = st.number_input("Parcels per step r (legacy)", min_value=1, value=10)
-    seed             = st.number_input("Random seed", min_value=0, value=42)
-    snapshot_stride  = st.number_input("Snapshot stride", min_value=1, value=10)
+    steps           = st.number_input("Time steps", min_value=1, value=200)
+    seed            = st.number_input("Random seed", min_value=0, value=42)
+    snapshot_stride = st.number_input("Snapshot stride", min_value=1, value=10)
 
     st.markdown("---")
     live_update_stride = st.number_input("Live update every n steps", min_value=0, value=10)
@@ -549,15 +519,13 @@ if "results" not in st.session_state:
 if run_btn:
     st.session_state.stop_requested = False
     params = SimParams(
-        N=int(N), T_a=float(T_a), k=float(k), alpha=float(alpha),
-        steps=int(steps), parcels_per_step=int(parcels_per_step),
-        seed=int(seed), snapshot_stride=int(snapshot_stride),
+        N=int(N), T_a=float(T_a), k=float(k), steps=int(steps), seed=int(seed), snapshot_stride=int(snapshot_stride),
         source_mode=str(source_mode), tau_g=float(tau_g), plateau_steps=int(plateau_steps), tau_d=float(tau_d),
-        source_area_frac=float(source_area_pct) / 100.0,
+        source_span_frac=float(source_span_pct) / 100.0,
         allow_diagonals=bool(allow_diagonals), epsilon_baseline=float(epsilon_baseline),
         lambda_per_Ta=float(lambda_per_Ta), distance_penalty=bool(distance_penalty), disable_gravity=bool(disable_gravity),
-        mu_vertical_tilt=float(mu_vertical_tilt),
-        beta_transfer=float(beta_transfer), boundary_mode=str(boundary_mode), epsilon_diffusion=float(epsilon_diffusion),
+        mu_vertical_tilt=float(mu_vertical_tilt), eta_token_quanta=float(eta_token_quanta),
+        epsilon_diffusion=float(epsilon_diffusion), boundary_mode=str(boundary_mode),
         barrier_enabled=bool(barrier_enabled), barrier_y0=int(barrier_y0), barrier_y1=int(barrier_y1), barrier_x0=int(barrier_x0), barrier_x1=int(barrier_x1),
     )
     st.session_state.params = params
@@ -568,7 +536,7 @@ if run_btn:
 
     def progress_cb(t, total, diag):
         pct = int(100 * t / total)
-        txt = f"Step {t}/{total} · sink_loss={diag.get('sink_loss', 0.0):.3f}"
+        txt = f"Step {t}/{total} · tokens_out={int(diag.get('tokens_out', 0))}"
         prog.progress(pct, text=txt)
         status.write(txt)
 
@@ -608,8 +576,7 @@ else:
         data = (T_sel / res.params.T_a).copy()
         if barrier_mask_plot is not None:
             data = np.ma.array(data, mask=barrier_mask_plot)
-        cmap = plt.get_cmap(cmap_name).copy()
-        cmap.set_bad(color="black")
+        cmap = plt.get_cmap(cmap_name).copy(); cmap.set_bad(color="black")
         norm = PowerNorm(gamma=gamma)
 
         fig1, ax1 = plt.subplots(figsize=(6, 6))
@@ -635,7 +602,7 @@ else:
 
         # Diagnostics
         fig3, ax3 = plt.subplots(figsize=(6, 3))
-        for key in ["max_T_over_Ta", "mean_T_over_Ta", "vertical_centroid", "sink_loss"]:
+        for key in ["max_T_over_Ta", "mean_T_over_Ta", "vertical_centroid", "tokens_out", "tokens_sink"]:
             ts = np.array(res.diagnostics.get(key, []))
             if ts.size:
                 ax3.plot(ts[:, 0], ts[:, 1], label=key)
@@ -658,10 +625,3 @@ if res is not None:
         st.download_button("Download snapshots (npz)", data=buf.getvalue(), file_name="plume_snapshots.npz", mime="application/zip")
     except Exception as e:
         st.warning(f"Could not package snapshots: {e}")
-
-# ---
-# Legacy parcel engine retained below as comments for reference
-# def step_once_persistent(...):
-#     ... parcel implementation ...
-# def run_simulation(...):
-#     ... parcel based loop ...
