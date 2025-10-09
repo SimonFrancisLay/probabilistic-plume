@@ -180,16 +180,16 @@ def _distance_penalty(p: SimParams) -> Dict[str, float]:
 
 
 def compute_flux_weights(Tp: float, Tn: Dict[str, float], *, params: SimParams) -> Dict[str, float]:
-    """Directional weights, overflow safe.
-    Up xV, up-diagonals x0.7 V, down and lateral divided by V. Uses expm1 and clamps exponent args.
-    """
     eps = max(0.0, params.epsilon_baseline)
     lam_eff = params.lambda_per_Ta / max(params.T_a, 1e-12)
 
-    # Vertical tilt with clamp
-    rel = max(Tp / max(params.T_a, 1e-12) - 1.0, 0.0)
-    tilt_arg = np.clip(params.mu_vertical_tilt * rel, 0.0, 50.0)
-    V = float(np.exp(tilt_arg))
+    # --- vertical tilt ---
+    if params.disable_gravity:
+        V = 1.0  # no vertical preference
+    else:
+        rel = max(Tp / max(params.T_a, 1e-12) - 1.0, 0.0)
+        tilt_arg = np.clip(params.mu_vertical_tilt * rel, 0.0, 50.0)
+        V = float(np.exp(tilt_arg))
 
     P = _direction_priors(Tp, params)
     C = _distance_penalty(params)
@@ -199,24 +199,25 @@ def compute_flux_weights(Tp: float, Tn: Dict[str, float], *, params: SimParams) 
     down_dirs     = {"down", "down_left", "down_right"}
     lateral_dirs  = {"left", "right"}
 
-    w: Dict[str, float] = {}
+    w = {}
     for d, Tdj in Tn.items():
         if d not in P:
             continue
         dT = Tp - Tdj
-        # Only positive gradient contributes
         arg = np.clip(lam_eff * max(dT, 0.0), 0.0, 50.0)
         g = np.expm1(arg)
         weight = (eps + g) * P[d] * C.get(d, 1.0)
 
-        if d in up_dirs:
-            weight *= V
-        elif d in up_diag_dirs:
-            weight *= 0.7 * V
-        elif d in down_dirs and V > 0:
-            weight /= V
-        elif d in lateral_dirs and V > 0:
-            weight /= V
+        # Only apply V if gravity is enabled
+        if not params.disable_gravity:
+            if d in up_dirs:
+                weight *= V
+            elif d in up_diag_dirs:
+                weight *= 0.7 * V
+            elif d in down_dirs and V > 0:
+                weight /= V
+            elif d in lateral_dirs and V > 0:
+                weight /= V
 
         if not np.isfinite(weight) or weight < 0.0:
             weight = 0.0
