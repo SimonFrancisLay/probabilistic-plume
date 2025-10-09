@@ -117,15 +117,23 @@ def source_multiplier(t: int, p: SimParams) -> float:
     return 1.0 + (p.k - 1.0) * np.exp(-(t - t_plateau_end) / max(p.tau_d, 1e-9))
 
 
-def source_region_coords(N: int, frac: float) -> Tuple[int, int, int, int]:
-    """Centered horizontal strip one cell tall, spanning about frac * N columns."""
+def source_row(N: int, disable_gravity: bool) -> int:
+    """Return the source row index: centre if gravity disabled, 25% from bottom if enabled."""
+    if disable_gravity:
+        return N // 2
+    # origin is lower, so i=0 bottom, i increases upward
+    return int(round(0.25 * (N - 1)))
+
+
+def source_region_coords(N: int, frac: float, *, row: int) -> Tuple[int, int, int, int]:
+    """Centered horizontal strip one cell tall on a specified row, spanning about frac * N columns."""
     frac = float(np.clip(frac, 0.0, 1.0))
     c = N // 2
     span = max(1, int(round(frac * N)))
     if span % 2 == 0:
         span = min(span + 1, N)
     half = span // 2
-    y0 = y1 = c
+    y0 = y1 = int(np.clip(row, 0, N - 1))
     x0 = max(0, c - half)
     x1 = min(N - 1, c + half)
     return y0, y1, x0, x1
@@ -134,7 +142,8 @@ def source_region_coords(N: int, frac: float) -> Tuple[int, int, int, int]:
 def init_grid(params: SimParams) -> np.ndarray:
     N = params.N
     T = np.full((N, N), params.T_a, dtype=np.float64)
-    y0, y1, x0, x1 = source_region_coords(N, params.source_span_frac)
+    r = source_row(N, params.disable_gravity)
+    y0, y1, x0, x1 = source_region_coords(N, params.source_span_frac, row=r)
     T[y0:y1+1, x0:x1+1] = params.k * params.T_a
     return T
 
@@ -217,19 +226,29 @@ def compute_flux_weights(Tp: float, Tn: Dict[str, float], *, params: SimParams) 
 # Barrier helpers and defaults
 # =============================
 
-def compute_default_barrier(N: int) -> Tuple[int, int, int, int]:
+def compute_default_barrier(N: int, *, gravity_on: bool) -> Tuple[int, int, int, int]:
+    """Return default barrier block extents depending on gravity state.
+    gravity_on: place barrier starting at mid height and extend upward by ~5% N.
+    gravity_off: keep prior behaviour (centred between centre and top).
+    """
     if N <= 0:
         return 0, 0, 0, 0
-    centre = N // 2
-    top = N - 1
-    mid = int(round((centre + top) / 2))
     thickness = max(1, int(round(0.05 * N)))
-    y0 = max(0, min(N - 1, mid - thickness // 2))
-    y1 = max(0, min(N - 1, y0 + thickness - 1))
     x0 = int(round(0.25 * (N - 1)))
     x1 = int(round((2.0 / 3.0) * (N - 1)))
     x0 = max(0, min(N - 1, x0))
     x1 = max(0, min(N - 1, x1))
+
+    if gravity_on:
+        y0 = N // 2
+        y1 = min(N - 1, y0 + thickness - 1)
+    else:
+        centre = N // 2
+        top = N - 1
+        mid = int(round((centre + top) / 2))
+        y0 = max(0, min(N - 1, mid - thickness // 2))
+        y1 = max(0, min(N - 1, y0 + thickness - 1))
+
     if y1 < y0:
         y1 = y0
     if x1 < x0:
@@ -237,13 +256,17 @@ def compute_default_barrier(N: int) -> Tuple[int, int, int, int]:
     return y0, y1, x0, x1
 
 
-def ensure_barrier_state_defaults(N: int) -> None:
+def ensure_barrier_state_defaults(N: int, *, gravity_on: bool) -> None:
+    # Recompute defaults when grid size or gravity state changes, or if missing
     if "prev_N" not in st.session_state:
         st.session_state.prev_N = int(N)
+    if "prev_gravity_on" not in st.session_state:
+        st.session_state.prev_gravity_on = bool(gravity_on)
     missing = any(k not in st.session_state for k in ("barrier_y0", "barrier_y1", "barrier_x0", "barrier_x1"))
-    if missing or st.session_state.prev_N != int(N):
+    if missing or st.session_state.prev_N != int(N) or st.session_state.prev_gravity_on != bool(gravity_on):
         st.session_state.prev_N = int(N)
-        by0, by1, bx0, bx1 = compute_default_barrier(int(N))
+        st.session_state.prev_gravity_on = bool(gravity_on)
+        by0, by1, bx0, bx1 = compute_default_barrier(int(N), gravity_on=bool(gravity_on))
         st.session_state.barrier_y0 = by0
         st.session_state.barrier_y1 = by1
         st.session_state.barrier_x0 = bx0
@@ -424,7 +447,8 @@ def run_simulation(
             break
         T_source = source_multiplier(t, params) * params.T_a
         if T_source > params.T_a + 1e-6:
-            y0, y1, x0, x1 = source_region_coords(params.N, params.source_span_frac)
+            r = source_row(params.N, params.disable_gravity)
+            y0, y1, x0, x1 = source_region_coords(params.N, params.source_span_frac, row=r)
             if barrier_mask is not None:
                 block = T[y0:y1+1, x0:x1+1]
                 mask_block = barrier_mask[y0:y1+1, x0:x1+1]
@@ -537,7 +561,7 @@ with st.sidebar:
     boundary_mode = st.selectbox("Boundary mode", ["Outflow", "Blocked", "Periodic"], index=0)
 
     # Ensure barrier defaults now that N is known
-    ensure_barrier_state_defaults(int(N))
+    ensure_barrier_state_defaults(int(N), gravity_on=not bool(disable_gravity))
     barrier_enabled, barrier_y0, barrier_y1, barrier_x0, barrier_x1 = barrier_controls(int(N))
 
     cmap_name, gamma, epsilon_diffusion = color_and_diffusion_controls()
