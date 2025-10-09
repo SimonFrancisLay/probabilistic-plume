@@ -468,6 +468,18 @@ def run_simulation(
         if live_update_stride and live_placeholder is not None and (t % live_update_stride == 0):
             try:
                 fig_live, ax_live = plt.subplots(figsize=(5, 5))
+                # Build a masked array so the barrier renders as 'bad' values
+                live_mask = build_barrier_mask(params.N, params)
+                live_data = T / params.T_a
+                if live_mask is not None:
+                    live_data = np.ma.array(live_data, mask=live_mask)
+
+                # Copy a cmap and set 'bad' to white so the barrier shows clearly
+                cmap_live = plt.get_cmap(cmap_name if 'cmap_name' in locals() else 'inferno').copy()
+                try:
+                    cmap_live.set_bad(color="white")
+                except Exception:
+                    pass
                 im = ax_live.imshow(
                     T / params.T_a,
                     origin="lower",
