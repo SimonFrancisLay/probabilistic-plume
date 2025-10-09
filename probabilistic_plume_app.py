@@ -1,16 +1,17 @@
 """
 Probabilistic plume model, Streamlit app
-Stochastic token flux engine (Method A): each cell exports heat as discrete tokens of size q,
-then for each token we sample a neighbour according to the directional probability weights.
+Stochastic token flux engine with A/B sampling toggle:
+A) Per token categorical sampling
+B) Single-step multinomial allocation
 
-Features kept from prior versions
+Features
 - Exponential dT weighting with directional priors and distance penalty
 - Temperature dependent vertical tilt with lateral clamp
   up: ×V, up-diagonals: ×0.7 V, down and lateral: ÷V, where V = exp(mu * max(T/T_a - 1, 0))
 - Source schedules and a centered source strip one cell tall, spanning a percent of width
 - Boundary modes: Outflow, Blocked, Periodic
 - Rectangular adiabatic barrier mask
-- Background diffusion after the stochastic transfer (optional, small)
+- Optional background diffusion after stochastic transfer
 - Progress bar, live updates, snapshots, diagnostics, export
 
 Run locally:
@@ -64,12 +65,13 @@ class SimParams:
     # Movement model parameters
     allow_diagonals: bool = True
     epsilon_baseline: float = 0.005
-    lambda_per_Ta: float = 1.8        # slightly stronger by default for stochastic
+    lambda_per_Ta: float = 1.8
     distance_penalty: bool = True
     disable_gravity: bool = False
     mu_vertical_tilt: float = 1.5
     # Stochastic token engine
     eta_token_quanta: float = 1e-3     # token size q = eta * T_a
+    sampling_mode: str = "Per token"   # "Per token" or "Multinomial"
     # Background diffusion
     epsilon_diffusion: float = 0.01
     # Boundaries
@@ -271,32 +273,29 @@ def background_diffuse(T: np.ndarray, params: SimParams, barrier_mask: Optional[
     return T_new
 
 # =============================
-# Stochastic token flux step (Method A)
+# Stochastic token flux step (A or B)
 # =============================
 
 def stochastic_flux_step(T: np.ndarray, *, params: SimParams, barrier_mask: Optional[np.ndarray], rng: np.random.Generator) -> Tuple[np.ndarray, Dict[str, float]]:
     N = params.N
     q = max(1e-12, params.eta_token_quanta * params.T_a)  # token heat
+    use_multinomial = (params.sampling_mode == "Multinomial")
 
     inflow = np.zeros_like(T)
     out_tokens = 0
     sink_tokens = 0
 
-    # We evaluate every cell, even if Xij == 0, to keep the math general as requested
     for i in range(N):
         for j in range(N):
             if barrier_mask is not None and barrier_mask[i, j]:
                 continue
             Tij = T[i, j]
             Xij = max(Tij - params.T_a, 0.0)
-            # Exported heat this step: beta equivalent via expected tokens
-            # For token model A without beta, the effective beta is q * E[n] / Xij after rounding.
-            # We control export rate implicitly by q. If you prefer an explicit beta, multiply Xij by beta here.
-            E = Xij  # use full excess; smaller q acts like smaller timestep. To mimic beta, set E = beta * Xij.
+            E = Xij  # exported heat; q controls effective step. To add explicit beta, use: E = beta * Xij
+            # We evaluate even if Xij == 0 to keep the scheme general
             if E <= 0.0:
                 continue
 
-            # Build neighbour list and temperatures
             nbrs = neighbor_map(i, j, N, allow_diagonals=params.allow_diagonals, boundary_mode=params.boundary_mode)
             Tn: Dict[str, float] = {}
             sink_dirs: List[str] = []
@@ -317,37 +316,43 @@ def stochastic_flux_step(T: np.ndarray, *, params: SimParams, barrier_mask: Opti
             s = sum(w.values())
             if s <= 0.0:
                 continue
-            # Probability vector over available directions only
             dirs = list(w.keys())
             pvec = np.array([w[d] / s for d in dirs], dtype=np.float64)
 
-            # Number of tokens from this cell: floor plus fractional Bernoulli
             n_float = E / q
             n_base = int(np.floor(n_float))
             n = n_base + (1 if rng.random() < (n_float - n_base) else 0)
             if n <= 0:
                 continue
 
-            # Sample n categorical draws in one call
-            choices = rng.choice(len(dirs), size=n, p=pvec)
             out_tokens += n
 
-            # Accumulate inflow per direction
-            for idx_choice in choices:
-                d = dirs[idx_choice]
-                if d in sink_dirs:
-                    sink_tokens += 1
-                    continue
-                ii, jj = nbrs[d]
-                inflow[ii, jj] += q
+            if use_multinomial:
+                alloc = rng.multinomial(n, pvec)  # shape (K,)
+                for k, m in enumerate(alloc):
+                    if m == 0:
+                        continue
+                    d = dirs[k]
+                    if d in sink_dirs:
+                        sink_tokens += m
+                        continue
+                    ii, jj = nbrs[d]
+                    inflow[ii, jj] += m * q
+            else:
+                choices = rng.choice(len(dirs), size=n, p=pvec)
+                for idx_choice in choices:
+                    d = dirs[idx_choice]
+                    if d in sink_dirs:
+                        sink_tokens += 1
+                        continue
+                    ii, jj = nbrs[d]
+                    inflow[ii, jj] += q
 
             # Remove exported heat from origin
             T[i, j] = max(params.T_a, T[i, j] - n * q)
 
-    # Apply inflow
     T_next = T + inflow
 
-    # Barrier enforcement and diffusion
     if barrier_mask is not None:
         T_next[barrier_mask] = params.T_a
     T_next = background_diffuse(T_next, params, barrier_mask)
@@ -390,7 +395,6 @@ def run_simulation(
     for t in range(1, params.steps + 1):
         if stop_check is not None and stop_check():
             break
-        # Source forcing while hotter than ambient
         T_source = source_multiplier(t, params) * params.T_a
         if T_source > params.T_a + 1e-6:
             y0, y1, x0, x1 = source_region_coords(params.N, params.source_span_frac)
@@ -455,7 +459,7 @@ def request_stop():
     st.session_state.stop_requested = True
 
 st.title("Probabilistic buoyant plume: stochastic token flux")
-st.caption("Each cell exports discrete heat tokens to neighbours according to probabilistic weights.")
+st.caption("Toggle between per token sampling and single-shot multinomial allocation.")
 
 with st.sidebar:
     st.header("Controls")
@@ -493,6 +497,8 @@ with st.sidebar:
         help="Token heat is q = η T_a. Smaller η gives more tokens and smoother motion; larger η is chunkier and faster.",
     )
 
+    sampling_mode = st.selectbox("Sampling mode", ["Per token", "Multinomial"], index=0, help="A: per token draws. B: one multinomial draw per cell.")
+
     boundary_mode = st.selectbox("Boundary mode", ["Outflow", "Blocked", "Periodic"], index=0)
 
     # Ensure barrier defaults now that N is known
@@ -524,7 +530,7 @@ if run_btn:
         source_span_frac=float(source_span_pct) / 100.0,
         allow_diagonals=bool(allow_diagonals), epsilon_baseline=float(epsilon_baseline),
         lambda_per_Ta=float(lambda_per_Ta), distance_penalty=bool(distance_penalty), disable_gravity=bool(disable_gravity),
-        mu_vertical_tilt=float(mu_vertical_tilt), eta_token_quanta=float(eta_token_quanta),
+        mu_vertical_tilt=float(mu_vertical_tilt), eta_token_quanta=float(eta_token_quanta), sampling_mode=str(sampling_mode),
         epsilon_diffusion=float(epsilon_diffusion), boundary_mode=str(boundary_mode),
         barrier_enabled=bool(barrier_enabled), barrier_y0=int(barrier_y0), barrier_y1=int(barrier_y1), barrier_x0=int(barrier_x0), barrier_x1=int(barrier_x1),
     )
