@@ -1,21 +1,22 @@
 """
 Probabilistic plume model, Streamlit app
-Stochastic token flux engine with A/B sampling toggle:
+Stochastic token flux engine with A or B sampling:
 A) Per token categorical sampling
 B) Single-step multinomial allocation
 
-Now hardened for large grids and hot cores:
+Hardened for large grids and hot cores:
 - Overflow safe exponentials in weight and tilt calculations
 - Probability vectors sanitised before sampling
-- Fixed colour scale in live and snapshot views (T/T_a from 1 to k)
+- Fixed colour scale in live and snapshot views, plotted as T/T_a in [1, k]
 
 Features
 - Exponential dT weighting with directional priors and distance penalty
 - Temperature dependent vertical tilt with lateral clamp
-  up: ×V, up-diagonals: ×0.7 V, down and lateral: ÷V, where V = exp(mu * max(T/T_a - 1, 0))
+  up: xV, up-diagonals: x0.7 V, down and lateral: divided by V, where V = exp(mu * max(T/T_a - 1, 0))
 - Source schedules and a centered source strip one cell tall, spanning a percent of width
+- Gravity dependent source and barrier defaults
 - Boundary modes: Outflow, Blocked, Periodic
-- Rectangular adiabatic barrier mask white
+- Rectangular adiabatic barrier mask
 - Optional background diffusion after stochastic transfer
 - Progress bar, live updates, snapshots, diagnostics, export
 
@@ -118,7 +119,7 @@ def source_multiplier(t: int, p: SimParams) -> float:
 
 
 def source_row(N: int, disable_gravity: bool) -> int:
-    """Return the source row index: centre if gravity disabled, 25% from bottom if enabled."""
+    """Return the source row index: centre if gravity disabled, 25 percent from bottom if enabled."""
     if disable_gravity:
         return N // 2
     # origin is lower, so i=0 bottom, i increases upward
@@ -180,7 +181,7 @@ def _distance_penalty(p: SimParams) -> Dict[str, float]:
 
 def compute_flux_weights(Tp: float, Tn: Dict[str, float], *, params: SimParams) -> Dict[str, float]:
     """Directional weights, overflow safe.
-    Up ×V, up-diagonals ×0.7 V, down and lateral ÷V. Uses expm1 and clamps exponent args.
+    Up xV, up-diagonals x0.7 V, down and lateral divided by V. Uses expm1 and clamps exponent args.
     """
     eps = max(0.0, params.epsilon_baseline)
     lam_eff = params.lambda_per_Ta / max(params.T_a, 1e-12)
@@ -205,7 +206,7 @@ def compute_flux_weights(Tp: float, Tn: Dict[str, float], *, params: SimParams) 
         dT = Tp - Tdj
         # Only positive gradient contributes
         arg = np.clip(lam_eff * max(dT, 0.0), 0.0, 50.0)
-        g = np.expm1(arg)  # stable exp(arg) - 1
+        g = np.expm1(arg)
         weight = (eps + g) * P[d] * C.get(d, 1.0)
 
         if d in up_dirs:
@@ -228,8 +229,8 @@ def compute_flux_weights(Tp: float, Tn: Dict[str, float], *, params: SimParams) 
 
 def compute_default_barrier(N: int, *, gravity_on: bool) -> Tuple[int, int, int, int]:
     """Return default barrier block extents depending on gravity state.
-    gravity_on: place barrier starting at mid height and extend upward by ~5% N.
-    gravity_off: keep prior behaviour (centred between centre and top).
+    gravity_on: place barrier starting at mid height and extend upward by about 5 percent N.
+    gravity_off: keep prior behaviour placed midway between centre and top.
     """
     if N <= 0:
         return 0, 0, 0, 0
@@ -318,7 +319,7 @@ def background_diffuse(T: np.ndarray, params: SimParams, barrier_mask: Optional[
 
 def stochastic_flux_step(T: np.ndarray, *, params: SimParams, barrier_mask: Optional[np.ndarray], rng: np.random.Generator) -> Tuple[np.ndarray, Dict[str, float]]:
     N = params.N
-    q = max(1e-12, params.eta_token_quanta * params.T_a)  # token heat
+    q = max(1e-12, params.eta_token_quanta * params.T_a)
     use_multinomial = (params.sampling_mode == "Multinomial")
 
     inflow = np.zeros_like(T)
@@ -331,8 +332,7 @@ def stochastic_flux_step(T: np.ndarray, *, params: SimParams, barrier_mask: Opti
                 continue
             Tij = T[i, j]
             Xij = max(Tij - params.T_a, 0.0)
-            E = Xij  # exported heat; q controls effective step size
-            # Evaluate every cell, even if Xij is zero, to keep scheme general
+            E = Xij
             if E <= 0.0:
                 continue
 
@@ -354,7 +354,6 @@ def stochastic_flux_step(T: np.ndarray, *, params: SimParams, barrier_mask: Opti
 
             w = compute_flux_weights(Tij, Tn, params=params)
 
-            # Build dirs and raw weights, sanitise
             dirs = list(w.keys())
             raw = np.array([w[d] for d in dirs], dtype=np.float64)
             raw[~np.isfinite(raw)] = 0.0
@@ -378,7 +377,7 @@ def stochastic_flux_step(T: np.ndarray, *, params: SimParams, barrier_mask: Opti
             out_tokens += n
 
             if use_multinomial:
-                alloc = rng.multinomial(n, pvec)  # shape (K,)
+                alloc = rng.multinomial(n, pvec)
                 for k, m in enumerate(alloc):
                     if m == 0:
                         continue
@@ -398,7 +397,6 @@ def stochastic_flux_step(T: np.ndarray, *, params: SimParams, barrier_mask: Opti
                     ii, jj = nbrs[d]
                     inflow[ii, jj] += q
 
-            # Remove exported heat from origin
             T[i, j] = max(params.T_a, T[i, j] - n * q)
 
     T_next = T + inflow
@@ -468,28 +466,28 @@ def run_simulation(
         if live_update_stride and live_placeholder is not None and (t % live_update_stride == 0):
             try:
                 fig_live, ax_live = plt.subplots(figsize=(5, 5))
-                # Build a masked array so the barrier renders as 'bad' values
                 live_mask = build_barrier_mask(params.N, params)
                 live_data = T / params.T_a
                 if live_mask is not None:
                     live_data = np.ma.array(live_data, mask=live_mask)
 
-                # Copy a cmap and set 'bad' to white so the barrier shows clearly
-                cmap_live = plt.get_cmap(cmap_name if 'cmap_name' in locals() else 'inferno').copy()
+                # Use chosen cmap and paint barrier as white
+                cmap_live = plt.get_cmap(cmap_name).copy()
                 try:
                     cmap_live.set_bad(color="white")
                 except Exception:
                     pass
+
                 im = ax_live.imshow(
-                    T / params.T_a,
+                    live_data,
                     origin="lower",
                     interpolation="nearest",
-                    cmap="inferno",
+                    cmap=cmap_live,
                     vmin=1.0,
                     vmax=params.k,
                 )
-                ax_live.set_title(f"Live field at t = {t}  (T/Tₐ fixed scale)")
-                fig_live.colorbar(im, ax=ax_live, fraction=0.046, pad=0.04, label="T/Tₐ")
+                ax_live.set_title(f"Live field at t = {t}  (T/T_a fixed scale)")
+                fig_live.colorbar(im, ax=ax_live, fraction=0.046, pad=0.04, label="T/T_a")
                 live_placeholder.pyplot(fig_live, clear_figure=True)
                 plt.close(fig_live)
             except Exception:
@@ -666,14 +664,13 @@ else:
             vmin=1.0,
             vmax=res.params.k,
         )
-        ax1.set_title(f"Field at t = {t_sel} (T/Tₐ, fixed scale)")
+        ax1.set_title(f"Field at t = {t_sel} (T/T_a, fixed scale)")
         ax1.set_xlabel("x index"); ax1.set_ylabel("y index")
-        fig1.colorbar(im, ax=ax1, fraction=0.046, pad=0.04, label="T/Tₐ")
+        fig1.colorbar(im, ax=ax1, fraction=0.046, pad=0.04, label="T/T_a")
         with col1:
             st.pyplot(fig1, clear_figure=True)
         plt.close(fig1)
 
-        # Centreline profile above centre
         c = res.params.N // 2
         profile = T_sel[c:, c] / res.params.T_a
         y = np.arange(profile.size)
@@ -685,7 +682,6 @@ else:
             st.pyplot(fig2, clear_figure=True)
         plt.close(fig2)
 
-        # Diagnostics
         fig3, ax3 = plt.subplots(figsize=(6, 3))
         for key in ["max_T_over_Ta", "mean_T_over_Ta", "vertical_centroid", "tokens_out", "tokens_sink"]:
             ts = np.array(res.diagnostics.get(key, []))
