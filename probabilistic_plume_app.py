@@ -2,9 +2,12 @@
 SSM model: Stochastic Smoke Model, full Streamlit app
 - Stochastic token flux plume engine with A or B sampling
 - Barriers Phase 1 editor with Solid or Hole rows, ordered application
-- Fixed colour scale for T/T_a in live and snapshots
+- Barriers moved to dedicated tab with Apply button, rows disabled by default
+- Robust parsing of barrier rows, no crashes on partial edits
+- Fixed colour scale for T/T_a in live and snapshots, white barriers
 - Gravity aware source placement and defaults
 - Optional incompressible cap: soft back pressure plus final clamp
+- Startup defaults, including barriers, can be supplied via ssm_config.json
 
 Run locally:
   pip install -r requirements.txt
@@ -21,6 +24,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Dict, List, Tuple, Optional
 
+import os
+import json
 import numpy as np
 import streamlit as st
 
@@ -34,6 +39,21 @@ except Exception as e:
     st.warning(f"Matplotlib not available: {e}. Install it via requirements.txt.")
 
 st.set_page_config(page_title="SSM model: stochastic smoke", page_icon="💨", layout="wide")
+
+# =============================================================
+# Config loading
+# =============================================================
+
+def load_config(path: str = "ssm_config.json") -> Optional[dict]:
+    try:
+        if os.path.exists(path):
+            with open(path, "r", encoding="utf-8") as f:
+                return json.load(f)
+    except Exception as e:
+        st.warning(f"Could not load config {path}: {e}")
+    return None
+
+CFG = load_config()
 
 # =============================================================
 # Parameters and results
@@ -68,7 +88,7 @@ class SimParams:
     epsilon_diffusion: float = 0.01
     # Boundaries
     boundary_mode: str = "Outflow"     # Outflow, Blocked, Periodic
-    # Barrier legacy fields retained for fallback
+    # Legacy rectangle barrier fallback
     barrier_enabled: bool = False
     barrier_y0: int = 50
     barrier_y1: int = 70
@@ -76,7 +96,7 @@ class SimParams:
     barrier_x1: int = 80
     # Incompressible cap
     cap_enabled: bool = False
-    cap_softness_per_Ta: float = 0.2   # delta relative to T_a for soft back pressure
+    cap_softness_per_Ta: float = 0.2
 
 
 @dataclass
@@ -96,9 +116,7 @@ def source_multiplier(t: int, p: SimParams) -> float:
         return p.k
     if p.source_mode == "Grow":
         return 1.0 + (p.k - 1.0) * (1.0 - math.exp(-max(t, 0) / max(p.tau_g, 1e-9)))
-    # Grow then plateau then decay
     s_grow = 1.0 + (p.k - 1.0) * (1.0 - math.exp(-max(t, 0) / max(p.tau_g, 1e-9)))
-    # time to reach about 99 percent of peak
     t_star = 0 if p.k <= 1.0 else int(max(0.0, np.ceil(-p.tau_g * np.log(max(1e-9, (p.k - 1.0) * 0.01 / max(p.k - 1.0, 1e-9))))))
     t_plateau_end = t_star + int(max(0, p.plateau_steps))
     if t < t_star:
@@ -109,7 +127,6 @@ def source_multiplier(t: int, p: SimParams) -> float:
 
 
 def source_row(N: int, disable_gravity: bool) -> int:
-    """Centre if gravity disabled, else 25 percent from bottom."""
     if disable_gravity:
         return N // 2
     return int(round(0.25 * (N - 1)))
@@ -141,7 +158,6 @@ def init_grid(params: SimParams) -> np.ndarray:
 # =============================================================
 
 def neighbor_map(i: int, j: int, N: int, *, allow_diagonals: bool, boundary_mode: str) -> Dict[str, Optional[Tuple[int, int]]]:
-    # origin lower: i increases upward
     moves = {"up": (1, 0), "down": (-1, 0), "left": (0, -1), "right": (0, 1)}
     if allow_diagonals:
         moves.update({"up_left": (1, -1), "up_right": (1, 1), "down_left": (-1, -1), "down_right": (-1, 1)})
@@ -171,16 +187,9 @@ def _distance_penalty(p: SimParams) -> Dict[str, float]:
 
 
 def _backpressure_factor(Tn: float, T_cap: float, delta: float) -> float:
-    """Smooth acceptance reduction as neighbor nears or exceeds cap.
-    factor = 1 / (1 + exp((Tn - T_cap) / delta)) so that:
-      Tn << T_cap  -> factor ~ 1
-      Tn =  T_cap  -> factor = 0.5
-      Tn >> T_cap  -> factor ~ 0
-    """
     if delta <= 0.0:
         return 0.0 if Tn >= T_cap else 1.0
     z = (Tn - T_cap) / delta
-    # clamp z to avoid overflow
     z = float(np.clip(z, -50.0, 50.0))
     return 1.0 / (1.0 + np.exp(z))
 
@@ -196,7 +205,6 @@ def compute_flux_weights(
     eps = max(0.0, params.epsilon_baseline)
     lam_eff = params.lambda_per_Ta / max(params.T_a, 1e-12)
 
-    # Vertical tilt, disabled if gravity off
     if params.disable_gravity:
         V = 1.0
     else:
@@ -232,16 +240,14 @@ def compute_flux_weights(
             elif d in lateral_dirs and V > 0:
                 weight /= V
         if use_cap:
-            # reduce acceptance if neighbor close to cap
-            factor = _backpressure_factor(Tdj, T_cap, delta_soft)
-            weight *= factor
+            weight *= _backpressure_factor(Tdj, T_cap, delta_soft)
         if not np.isfinite(weight) or weight < 0.0:
             weight = 0.0
         w[d] = float(weight)
     return w
 
 # =============================================================
-# Barrier editor Phase 1: Solid and Hole rows in input order
+# Barrier editor, helpers
 # =============================================================
 
 def _bresenham(i0: int, j0: int, i1: int, j1: int) -> List[Tuple[int, int]]:
@@ -291,12 +297,18 @@ def _apply_thickness(mask: np.ndarray, cells: List[Tuple[int, int]], radius: int
 
 
 def default_barrier_rows(N: int, *, gravity_on: bool) -> List[Dict]:
+    # Prefer config if present and matching grid size
+    if CFG and CFG.get("barriers", {}).get("enabled", False):
+        rows = CFG.get("barriers", {}).get("rows", [])
+        # trust user provided rows for any N, they are bounds clipped later
+        return rows
+    # Fallback: gravity based
     thickness = 1
     if gravity_on:
         i = N // 2
         j0 = int(round(0.25 * (N - 1)))
         j1 = int(round((2.0 / 3.0) * (N - 1)))
-        return [{"type": "Line", "mode": "Solid", "j0": j0, "i0": i, "j1": j1, "i1": i, "thickness": thickness, "enabled": True}]
+        return [{"type": "Line", "mode": "Solid", "j0": j0, "i0": i, "j1": j1, "i1": i, "thickness": thickness, "enabled": False}]
     else:
         centre = N // 2
         top = N - 1
@@ -306,7 +318,7 @@ def default_barrier_rows(N: int, *, gravity_on: bool) -> List[Dict]:
         y1 = max(0, min(N - 1, y0 + h - 1))
         j0 = int(round(0.25 * (N - 1)))
         j1 = int(round((2.0 / 3.0) * (N - 1)))
-        return [{"type": "Rect", "mode": "Solid", "j0": j0, "i0": y0, "j1": j1, "i1": y1, "thickness": thickness, "enabled": True}]
+        return [{"type": "Rect", "mode": "Solid", "j0": j0, "i0": y0, "j1": j1, "i1": y1, "thickness": thickness, "enabled": False}]
 
 
 def ensure_barrier_rows_defaults(N: int, *, gravity_on: bool) -> None:
@@ -322,16 +334,45 @@ def ensure_barrier_rows_defaults(N: int, *, gravity_on: bool) -> None:
         st.session_state.barrier_rows = default_barrier_rows(N, gravity_on=gravity_on)
 
 
+def _safe_int(x, default=None):
+    try:
+        if x is None:
+            return default
+        if isinstance(x, float) and np.isnan(x):
+            return default
+        return int(x)
+    except Exception:
+        return default
+
+
 def build_barrier_mask_from_rows(N: int, rows: List[Dict]) -> Optional[np.ndarray]:
     if not rows:
         return None
+
+    def _row_complete(r: Dict) -> bool:
+        if not r.get("enabled", False):
+            return False
+        needed = ["j0", "i0", "j1", "i1", "thickness"]
+        parsed = {k: _safe_int(r.get(k)) for k in needed}
+        if any(v is None for v in parsed.values()):
+            return False
+        j0, i0, j1, i1, thick = parsed["j0"], parsed["i0"], parsed["j1"], parsed["i1"], parsed["thickness"]
+        if not (0 <= i0 < N and 0 <= i1 < N and 0 <= j0 < N and 0 <= j1 < N):
+            return False
+        if thick < 1:
+            return False
+        return True
+
     mask = np.zeros((N, N), dtype=bool)
 
     def draw_row(target: np.ndarray, row: Dict, value: bool) -> None:
         typ = str(row.get("type", "Line"))
-        j0 = int(np.clip(row.get("j0", 0), 0, N - 1)); i0 = int(np.clip(row.get("i0", 0), 0, N - 1))
-        j1 = int(np.clip(row.get("j1", j0), 0, N - 1)); i1 = int(np.clip(row.get("i1", i0), 0, N - 1))
-        thick = max(1, int(row.get("thickness", 1) or 1))
+        j0 = _safe_int(row.get("j0"), 0); i0 = _safe_int(row.get("i0"), 0)
+        j1 = _safe_int(row.get("j1"), j0); i1 = _safe_int(row.get("i1"), i0)
+        # clip to bounds
+        j0 = int(np.clip(j0, 0, N - 1)); j1 = int(np.clip(j1, 0, N - 1))
+        i0 = int(np.clip(i0, 0, N - 1)); i1 = int(np.clip(i1, 0, N - 1))
+        thick = max(1, _safe_int(row.get("thickness"), 1) or 1)
         radius = (thick - 1) // 2
         if typ.lower().startswith("line"):
             pts = _bresenham(i0, j0, i1, j1)
@@ -342,7 +383,7 @@ def build_barrier_mask_from_rows(N: int, rows: List[Dict]) -> Optional[np.ndarra
             _apply_thickness(target, cells, radius, value)
 
     for row in rows:
-        if not row.get("enabled", True):
+        if not _row_complete(row):
             continue
         mode = str(row.get("mode", "Solid")).lower()
         draw_row(mask, row, False if mode == "hole" else True)
@@ -351,7 +392,10 @@ def build_barrier_mask_from_rows(N: int, rows: List[Dict]) -> Optional[np.ndarra
 
 
 def build_barrier_mask(N: int, p: SimParams) -> Optional[np.ndarray]:
-    rows = st.session_state.get("barrier_rows", [])
+    rows = st.session_state.get("barrier_rows_applied", None)
+    if rows is None:
+        # fall back to current editable rows, but they may be incomplete, so build will ignore as needed
+        rows = st.session_state.get("barrier_rows", [])
     m = build_barrier_mask_from_rows(N, rows)
     if m is not None:
         return m
@@ -367,7 +411,7 @@ def build_barrier_mask(N: int, p: SimParams) -> Optional[np.ndarray]:
 
 
 def barrier_table_editor(N: int, gravity_on: bool) -> None:
-    st.subheader("Barriers (Phase 1)")
+    st.subheader("Barrier designer")
     ensure_barrier_rows_defaults(N, gravity_on=gravity_on)
     rows = st.session_state.barrier_rows
 
@@ -379,31 +423,57 @@ def barrier_table_editor(N: int, gravity_on: bool) -> None:
         "j1": st.column_config.NumberColumn("j1 (x1)", step=1, min_value=0, max_value=N-1),
         "i1": st.column_config.NumberColumn("i1 (y1)", step=1, min_value=0, max_value=N-1),
         "thickness": st.column_config.NumberColumn("thickness (cells)", step=1, min_value=1, max_value=25),
-        "enabled": st.column_config.CheckboxColumn("enabled", default=True),
+        "enabled": st.column_config.CheckboxColumn("enabled", default=False),
     }
 
-    edited = st.data_editor(rows, num_rows="dynamic", column_config=colconf,
-                            use_container_width=True, key="barrier_rows_editor")
+    edited = st.data_editor(
+        rows,
+        num_rows="dynamic",
+        column_config=colconf,
+        key="barrier_rows_editor",
+        width="stretch",
+        hide_index=True,
+    )
 
-    st.session_state.barrier_rows = [{
-        "type": r.get("type", "Line"),
-        "mode": r.get("mode", "Solid"),
-        "j0": int(r.get("j0", 0) or 0),
-        "i0": int(r.get("i0", 0) or 0),
-        "j1": int(r.get("j1", 0) or 0),
-        "i1": int(r.get("i1", 0) or 0),
-        "thickness": max(1, int(r.get("thickness", 1) or 1)),
-        "enabled": bool(r.get("enabled", True)),
-    } for r in edited]
+    # Clean without forcing ints until present; leave None for partial edits
+    cleaned: List[Dict] = []
+    for r in edited:
+        cleaned.append({
+            "type": r.get("type", "Line"),
+            "mode": r.get("mode", "Solid"),
+            "j0": _safe_int(r.get("j0"), None),
+            "i0": _safe_int(r.get("i0"), None),
+            "j1": _safe_int(r.get("j1"), None),
+            "i1": _safe_int(r.get("i1"), None),
+            "thickness": max(1, _safe_int(r.get("thickness"), 1) or 1),
+            "enabled": bool(r.get("enabled", False)),
+        })
+    st.session_state.barrier_rows = cleaned
 
-    with st.expander("Barrier preview", expanded=False):
+    c1, c2, c3, c4 = st.columns(4)
+    with c1:
+        if st.button("Add default barriers"):
+            st.session_state.barrier_rows += default_barrier_rows(N, gravity_on=gravity_on)
+    with c2:
+        if st.button("Clear all"):
+            st.session_state.barrier_rows = []
+    with c3:
+        if st.button("Disable all"):
+            for r in st.session_state.barrier_rows:
+                r["enabled"] = False
+    with c4:
+        if st.button("Apply barriers", type="primary"):
+            st.session_state.barrier_rows_applied = [r.copy() for r in st.session_state.barrier_rows]
+            st.success("Applied barrier set for the next run")
+
+    with st.expander("Preview", expanded=False):
         try:
             preview_rows = st.session_state.get("barrier_rows", [])
             preview_mask = build_barrier_mask_from_rows(int(N), preview_rows)
             if HAVE_MPL:
-                fig_prev, ax_prev = plt.subplots(figsize=(3, 3))
+                fig_prev, ax_prev = plt.subplots(figsize=(4, 4))
                 if preview_mask is None:
-                    ax_prev.text(0.5, 0.5, "No barriers", ha="center", va="center")
+                    ax_prev.text(0.5, 0.5, "No enabled barriers", ha="center", va="center")
                     ax_prev.set_axis_off()
                 else:
                     ax_prev.imshow(preview_mask, origin="lower", interpolation="nearest", cmap="gray_r")
@@ -443,7 +513,7 @@ def background_diffuse(T: np.ndarray, params: SimParams, barrier_mask: Optional[
     return T_new
 
 # =============================================================
-# Stochastic token flux step (A or B)
+# Stochastic token flux step
 # =============================================================
 
 def stochastic_flux_step(
@@ -548,7 +618,6 @@ def stochastic_flux_step(
         T_next[barrier_mask] = params.T_a
     T_next = background_diffuse(T_next, params, barrier_mask)
 
-    # Final hard clamp to cap if enabled
     if params.cap_enabled and (T_cap is not None):
         T_next = np.minimum(T_next, T_cap)
 
@@ -580,7 +649,6 @@ def run_simulation(
     T = init_grid(params)
     barrier_mask = build_barrier_mask(params.N, params)
 
-    # running cap uses source running max
     T_cap_running = params.k * params.T_a if params.cap_enabled else None
     delta_soft = params.cap_softness_per_Ta * params.T_a if params.cap_enabled else None
 
@@ -643,7 +711,7 @@ def run_simulation(
                     cmap_live.set_bad(color="white")
                 except Exception:
                     pass
-                norm_live = PowerNorm(gamma=st.session_state.get("gamma_live", 1.0), vmin=1.0, vmax=params.k)
+                norm_live = PowerNorm(gamma=st.session_state.get("gamma_live", 1.0))
                 im = ax_live.imshow(
                     live_data,
                     origin="lower",
@@ -675,7 +743,7 @@ def color_and_diffusion_controls() -> Tuple[str, float, float]:
     return str(cmap_name), float(gamma), float(epsilon_diffusion)
 
 # =============================================================
-# Sidebar and run controls
+# Tabs: Run, Barriers, Results
 # =============================================================
 
 if "stop_requested" not in st.session_state:
@@ -685,194 +753,224 @@ def request_stop():
     st.session_state.stop_requested = True
 
 st.title("SSM model: stochastic smoke plume")
-st.caption("Per token vs multinomial sampling, Solid or Hole barriers, fixed T/T_a scale, gravity aware defaults, optional incompressible cap.")
+st.caption("Per token vs multinomial sampling, Solid or Hole barriers on their own tab, fixed T/T_a scale, gravity aware defaults, optional incompressible cap, config driven defaults.")
 
-with st.sidebar:
-    st.header("Controls")
-    N   = st.number_input("Grid size N", min_value=21, max_value=401, value=99, step=2)
-    T_a = st.number_input("Ambient temperature T_a", min_value=0.1, value=20.0)
-    k   = st.number_input("Source peak multiplier k", min_value=1.0, value=5.0)
+# Defaults from config, if present
+_defaults = CFG.get("app_defaults", {}) if CFG else {}
 
-    source_mode = st.selectbox("Source profile", ["Persistent", "Grow", "Grow-plateau-decay"], index=0)
-    col_s1, col_s2, col_s3 = st.columns(3)
-    with col_s1:
-        tau_g = st.number_input("Growth tau (steps)", min_value=1.0, value=20.0)
-    with col_s2:
-        plateau_steps = st.number_input("Plateau steps", min_value=0, value=50)
-    with col_s3:
-        tau_d = st.number_input("Decay tau (steps)", min_value=1.0, value=40.0)
+tab_run, tab_bar, tab_res = st.tabs(["Run", "Barriers", "Results"]) 
 
-    source_span_pct = st.slider(
-        "Source span (% of width)",
-        min_value=0.5, max_value=50.0, value=5.0, step=0.5,
-        help="Centered horizontal strip, one cell tall, spanning this percent of the grid width",
-    )
+with tab_run:
+    st.header("Run controls")
 
-    st.subheader("Movement model")
-    allow_diagonals  = st.checkbox("Allow diagonal moves", value=True)
-    epsilon_baseline = st.slider("Baseline eps (floor)", 0.0, 0.05, 0.005, step=0.001)
-    lambda_per_Ta    = st.slider("dT sensitivity lambda (per T_a)", 0.0, 3.5, 1.8, step=0.05)
-    distance_penalty = st.checkbox("Distance penalty for diagonals (1/sqrt(2))", value=True)
-    disable_gravity  = st.checkbox("Disable gravity bias", value=False)
-    mu_vertical_tilt = st.slider("Vertical tilt μ", 0.0, 3.0, 1.5, 0.1)
+    with st.expander("Basic setup", expanded=True):
+        cols = st.columns([1,1,1,1])
+        with cols[0]:
+            N   = st.number_input("Grid size N", min_value=21, max_value=401, value=int(_defaults.get("N", 99)), step=2)
+        with cols[1]:
+            T_a = st.number_input("Ambient temperature T_a", min_value=0.1, value=float(_defaults.get("T_a", 20.0)))
+        with cols[2]:
+            k   = st.number_input("Source peak multiplier k", min_value=1.0, value=float(_defaults.get("k", 5.0)))
+        with cols[3]:
+            steps = st.number_input("Time steps", min_value=1, value=int(_defaults.get("steps", 200)))
 
-    st.subheader("Stochastic tokens")
-    eta_token_quanta = st.select_slider(
-        "Token quantum η (in units of T_a)",
-        options=[1e-4, 2e-4, 5e-4, 1e-3, 2e-3, 5e-3, 1e-2], value=1e-3,
-        help="Token heat is q = η T_a. Smaller η gives more tokens and smoother motion; larger η is chunkier and faster.",
-    )
-
-    sampling_mode = st.selectbox("Sampling mode", ["Per token", "Multinomial"], index=0)
-
-    boundary_mode = st.selectbox("Boundary mode", ["Outflow", "Blocked", "Periodic"], index=0)
-
-    # Barrier editor
-    barrier_table_editor(int(N), gravity_on=not bool(disable_gravity))
-
-    st.subheader("Incompressible cap")
-    cap_enabled = st.checkbox("Enable soft cap and final clamp", value=False)
-    cap_softness_per_Ta = st.slider(
-        "Cap softness δ in units of T_a",
-        min_value=0.02, max_value=1.0, value=0.2, step=0.02,
-        help="Back pressure starts to bite as neighbors approach the running max source temp. Smaller δ is sharper.",
-    )
-
-    cmap_name, gamma, epsilon_diffusion = color_and_diffusion_controls()
-
-    steps           = st.number_input("Time steps", min_value=1, value=200)
-    seed            = st.number_input("Random seed", min_value=0, value=42)
-    snapshot_stride = st.number_input("Snapshot stride", min_value=1, value=10)
-
-    st.markdown("---")
-    live_update_stride = st.number_input("Live update every n steps", min_value=0, value=10)
-    stop_btn = st.button("Stop", on_click=request_stop)
-    run_btn  = st.button("Run simulation", type="primary")
-
-# Session store
-if "params" not in st.session_state:
-    st.session_state.params = None
-if "results" not in st.session_state:
-    st.session_state.results = None
-
-if run_btn:
-    st.session_state.stop_requested = False
-    params = SimParams(
-        N=int(N), T_a=float(T_a), k=float(k), steps=int(steps), seed=int(seed), snapshot_stride=int(snapshot_stride),
-        source_mode=str(source_mode), tau_g=float(tau_g), plateau_steps=int(plateau_steps), tau_d=float(tau_d),
-        source_span_frac=float(source_span_pct) / 100.0,
-        allow_diagonals=bool(allow_diagonals), epsilon_baseline=float(epsilon_baseline),
-        lambda_per_Ta=float(lambda_per_Ta), distance_penalty=bool(distance_penalty), disable_gravity=bool(disable_gravity),
-        mu_vertical_tilt=float(mu_vertical_tilt), eta_token_quanta=float(eta_token_quanta), sampling_mode=str(sampling_mode),
-        epsilon_diffusion=float(epsilon_diffusion), boundary_mode=str(boundary_mode),
-        barrier_enabled=False,
-        cap_enabled=bool(cap_enabled), cap_softness_per_Ta=float(cap_softness_per_Ta),
-    )
-    st.session_state.params = params
-
-    prog = st.progress(0, text="Starting simulation…")
-    status = st.empty()
-    live_placeholder = st.empty() if live_update_stride else None
-
-    def progress_cb(t, total, diag):
-        pct = int(100 * t / total)
-        cap_txt = f" · cap={(diag.get('T_cap_over_Ta', 0.0)):.2f} T_a" if params.cap_enabled else ""
-        txt = f"Step {t}/{total} · tokens_out={int(diag.get('tokens_out', 0))}{cap_txt}"
-        prog.progress(pct, text=txt)
-        status.write(txt)
-
-    def stop_check():
-        return st.session_state.stop_requested
-
-    with st.spinner("Running simulation..."):
-        st.session_state.results = run_simulation(
-            params,
-            progress_cb=progress_cb,
-            live_update_stride=int(live_update_stride),
-            live_placeholder=live_placeholder,
-            stop_check=stop_check,
+        source_mode = st.selectbox(
+            "Source profile",
+            ["Persistent", "Grow", "Grow-plateau-decay"],
+            index=["Persistent","Grow","Grow-plateau-decay"].index(_defaults.get("source_mode","Grow-plateau-decay"))
         )
-    prog.empty()
 
-# =============================================================
-# Visuals and export
-# =============================================================
+        c1, c2, c3 = st.columns(3)
+        with c1:
+            tau_g = st.number_input("Growth tau (steps)", min_value=1.0, value=float(_defaults.get("tau_g", 20.0)))
+        with c2:
+            plateau_steps = st.number_input("Plateau steps", min_value=0, value=int(_defaults.get("plateau_steps", 50)))
+        with c3:
+            tau_d = st.number_input("Decay tau (steps)", min_value=1.0, value=float(_defaults.get("tau_d", 40.0)))
 
-res: Optional[SimResults] = st.session_state.results
-col1, col2 = st.columns([2, 1])
-
-if res is None:
-    with col1:
-        st.info("Press Run simulation to generate a field. A heatmap will appear here.")
-    with col2:
-        st.info("Diagnostics and profiles will appear here.")
-else:
-    if not HAVE_MPL:
-        st.error("Matplotlib is required for plots. Install it via requirements.txt.")
-    else:
-        sel = st.slider("View snapshot", 0, len(res.snapshots) - 1, len(res.snapshots) - 1)
-        t_sel, T_sel = res.snapshots[sel]
-
-        barrier_mask_plot = build_barrier_mask(res.params.N, res.params)
-        data = (T_sel / res.params.T_a).copy()
-        if barrier_mask_plot is not None:
-            data = np.ma.array(data, mask=barrier_mask_plot)
-        cmap = plt.get_cmap(st.session_state.get("cmap_name_live", "inferno")).copy()
-        try:
-            cmap.set_bad(color="white")
-        except Exception:
-            pass
-        norm = PowerNorm(gamma=st.session_state.get("gamma_live", 1.0), vmin=1.0, vmax=res.params.k)
-
-        fig1, ax1 = plt.subplots(figsize=(6, 6))
-        im = ax1.imshow(
-            data,
-            origin="lower",
-            interpolation="nearest",
-            cmap=cmap,
-            norm=norm,
+        source_span_pct = st.slider(
+            "Source span (% of width)",
+            min_value=0.5, max_value=50.0, value=float(_defaults.get("source_span_pct", 5.0)), step=0.5,
+            help="Centered horizontal strip one cell tall, given as percent of grid width"
         )
-        ax1.set_title(f"Field at t = {t_sel} (T/T_a, fixed scale)")
-        ax1.set_xlabel("x index"); ax1.set_ylabel("y index")
-        fig1.colorbar(im, ax=ax1, fraction=0.046, pad=0.04, label="T/T_a")
+
+        c4, c5 = st.columns(2)
+        with c4:
+            snapshot_stride = st.number_input("Snapshot stride", min_value=1, value=int(_defaults.get("snapshot_stride", 10)))
+        with c5:
+            live_update_stride = st.number_input("Live update every n steps", min_value=0, value=int(_defaults.get("live_update_stride", 10)))
+
+    with st.expander("Advanced options", expanded=False):
+        st.markdown("**Movement model**")
+        allow_diagonals  = st.checkbox("Allow diagonal moves", value=bool(_defaults.get("allow_diagonals", True)))
+        epsilon_baseline = st.slider("Baseline eps (floor)", 0.0, 0.05, float(_defaults.get("epsilon_baseline", 0.005)), step=0.001)
+        lambda_per_Ta    = st.slider("dT sensitivity lambda (per T_a)", 0.0, 3.5, float(_defaults.get("lambda_per_Ta", 1.8)), step=0.05)
+        distance_penalty = st.checkbox("Distance penalty for diagonals (1/sqrt(2))", value=bool(_defaults.get("distance_penalty", True)))
+        disable_gravity  = st.checkbox("Disable gravity bias", value=bool(_defaults.get("disable_gravity", False)))
+        mu_vertical_tilt = st.slider("Vertical tilt μ", 0.0, 3.0, float(_defaults.get("mu_vertical_tilt", 1.5)), 0.1)
+
+        st.markdown("---")
+        st.markdown("**Stochastic tokens**")
+        eta_token_quanta = st.select_slider(
+            "Token quantum η (in units of T_a)",
+            options=[1e-4, 2e-4, 5e-4, 1e-3, 2e-3, 5e-3, 1e-2], value=float(_defaults.get("eta_token_quanta", 1e-3)),
+            help="Token heat is q = η T_a. Smaller η gives more tokens and smoother motion; larger η is chunkier and faster."
+        )
+        sampling_mode = st.selectbox(
+            "Sampling mode", ["Per token", "Multinomial"],
+            index=["Per token","Multinomial"].index(_defaults.get("sampling_mode","Per token"))
+        )
+
+        st.markdown("---")
+        st.markdown("**Boundaries and diffusion**")
+        boundary_mode = st.selectbox(
+            "Boundary mode", ["Outflow", "Blocked", "Periodic"],
+            index=["Outflow","Blocked","Periodic"].index(_defaults.get("boundary_mode","Outflow"))
+        )
+        cmap_name, gamma, epsilon_diffusion = color_and_diffusion_controls()
+
+        st.markdown("---")
+        st.markdown("**Incompressible cap**")
+        cap_enabled = st.checkbox("Enable soft cap and final clamp", value=bool(_defaults.get("cap_enabled", True)))
+        cap_softness_per_Ta = st.slider(
+            "Cap softness δ in units of T_a",
+            min_value=0.02, max_value=1.0, value=float(_defaults.get("cap_softness_per_Ta", 0.2)), step=0.02,
+            help="Back pressure starts to bite as neighbors approach the running max source temp. Smaller δ is sharper."
+        )
+
+        st.markdown("---")
+        seed = st.number_input("Random seed", min_value=0, value=int(_defaults.get("seed", 42)))
+
+    # Run button at the bottom, unchanged logic
+    if st.button("Run simulation", type="primary"):
+        st.session_state.stop_requested = False
+        params = SimParams(
+            N=int(N), T_a=float(T_a), k=float(k), steps=int(steps), seed=int(seed), snapshot_stride=int(snapshot_stride),
+            source_mode=str(source_mode), tau_g=float(tau_g), plateau_steps=int(plateau_steps), tau_d=float(tau_d),
+            source_span_frac=float(source_span_pct) / 100.0,
+            allow_diagonals=bool(allow_diagonals), epsilon_baseline=float(epsilon_baseline),
+            lambda_per_Ta=float(lambda_per_Ta), distance_penalty=bool(distance_penalty), disable_gravity=bool(disable_gravity),
+            mu_vertical_tilt=float(mu_vertical_tilt), eta_token_quanta=float(eta_token_quanta), sampling_mode=str(sampling_mode),
+            epsilon_diffusion=float(epsilon_diffusion), boundary_mode=str(boundary_mode),
+            barrier_enabled=False,
+            cap_enabled=bool(cap_enabled), cap_softness_per_Ta=float(cap_softness_per_Ta),
+        )
+        st.session_state.params = params
+
+        prog = st.progress(0, text="Starting simulation…")
+        status = st.empty()
+        live_placeholder = st.empty() if live_update_stride else None
+
+        def progress_cb(t, total, diag):
+            pct = int(100 * t / total)
+            cap_txt = f" · cap={(diag.get('T_cap_over_Ta', 0.0)):.2f} T_a" if params.cap_enabled else ""
+            txt = f"Step {t}/{total} · tokens_out={int(diag.get('tokens_out', 0))}{cap_txt}"
+            prog.progress(pct, text=txt)
+            status.write(txt)
+
+        def stop_check():
+            return st.session_state.stop_requested
+
+        with st.spinner("Running simulation..."):
+            res = run_simulation(
+                params,
+                progress_cb=progress_cb,
+                live_update_stride=int(live_update_stride),
+                live_placeholder=live_placeholder,
+                stop_check=stop_check,
+            )
+        st.session_state.results = res
+        prog.empty()
+
+with tab_bar:
+    st.header("Barrier setup")
+    # seed barrier rows from config on first load only
+    if CFG and CFG.get("barriers") and "seeded_from_cfg" not in st.session_state:
+        st.session_state.barrier_rows = CFG["barriers"].get("rows", [])
+        st.session_state.barrier_rows_applied = [r.copy() for r in st.session_state.barrier_rows]
+        st.session_state["seeded_from_cfg"] = True
+    # Use grid size and gravity from current or default params for sensible defaults if no config
+    current_N = int(st.session_state.get("params", SimParams(N=int(_defaults.get("N", 99)))).N)
+    current_grav_on = not bool(st.session_state.get("params", SimParams(disable_gravity=bool(_defaults.get("disable_gravity", False)))).disable_gravity)
+    barrier_table_editor(current_N, current_grav_on)
+
+with tab_res:
+    st.header("Results")
+    res: Optional[SimResults] = st.session_state.get("results")
+    col1, col2 = st.columns([2, 1])
+
+    if res is None:
         with col1:
-            st.pyplot(fig1, clear_figure=True)
-        plt.close(fig1)
-
-        # Centreline profile above centre
-        c = res.params.N // 2
-        profile = T_sel[c:, c] / res.params.T_a
-        y = np.arange(profile.size)
-        fig2, ax2 = plt.subplots(figsize=(6, 4))
-        ax2.plot(profile, y)
-        ax2.set_xlabel("T/T_a"); ax2.set_ylabel("vertical distance above centre")
-        ax2.set_title("Centreline profile above source")
+            st.info("Press Run simulation to generate a field. A heatmap will appear here.")
         with col2:
-            st.pyplot(fig2, clear_figure=True)
-        plt.close(fig2)
+            st.info("Diagnostics and profiles will appear here.")
+    else:
+        if not HAVE_MPL:
+            st.error("Matplotlib is required for plots. Install it via requirements.txt.")
+        else:
+            sel = st.slider("View snapshot", 0, len(res.snapshots) - 1, len(res.snapshots) - 1)
+            t_sel, T_sel = res.snapshots[sel]
 
-        # Diagnostics
-        fig3, ax3 = plt.subplots(figsize=(6, 3))
-        keys = ["max_T_over_Ta", "mean_T_over_Ta", "vertical_centroid", "tokens_out", "tokens_sink"]
-        if "T_cap_over_Ta" in res.diagnostics:
-            keys.append("T_cap_over_Ta")
-        for key in keys:
-            ts = np.array(res.diagnostics.get(key, []))
-            if ts.size:
-                ax3.plot(ts[:, 0], ts[:, 1], label=key)
-        ax3.set_xlabel("time step"); ax3.set_ylabel("value"); ax3.set_title("Diagnostics time series"); ax3.legend()
-        with col2:
-            st.pyplot(fig3, clear_figure=True)
-        plt.close(fig3)
+            barrier_mask_plot = build_barrier_mask(res.params.N, res.params)
+            data = (T_sel / res.params.T_a).copy()
+            if barrier_mask_plot is not None:
+                data = np.ma.array(data, mask=barrier_mask_plot)
+            cmap = plt.get_cmap(st.session_state.get("cmap_name_live", "inferno")).copy()
+            try:
+                cmap.set_bad(color="white")
+            except Exception:
+                pass
+            norm = PowerNorm(gamma=st.session_state.get("gamma_live", 1.0))
 
-# Export
-if res is not None:
-    st.subheader("Export")
-    snaps = {f"t{t}": arr for t, arr in res.snapshots}
-    try:
-        import io
-        buf = io.BytesIO()
-        np.savez_compressed(buf, **snaps)
-        st.download_button("Download snapshots (npz)", data=buf.getvalue(), file_name="plume_snapshots.npz", mime="application/zip")
-    except Exception as e:
-        st.warning(f"Could not package snapshots: {e}")
+            fig1, ax1 = plt.subplots(figsize=(6, 6))
+            im = ax1.imshow(
+                data,
+                origin="lower",
+                interpolation="nearest",
+                cmap=cmap,
+                norm=norm,
+            )
+            ax1.set_title(f"Field at t = {t_sel} (T/T_a, fixed scale)")
+            ax1.set_xlabel("x index"); ax1.set_ylabel("y index")
+            fig1.colorbar(im, ax=ax1, fraction=0.046, pad=0.04, label="T/T_a")
+            with col1:
+                st.pyplot(fig1, clear_figure=True)
+            plt.close(fig1)
+
+            # Centreline profile above centre
+            c = res.params.N // 2
+            profile = T_sel[c:, c] / res.params.T_a
+            y = np.arange(profile.size)
+            fig2, ax2 = plt.subplots(figsize=(6, 4))
+            ax2.plot(profile, y)
+            ax2.set_xlabel("T/T_a"); ax2.set_ylabel("vertical distance above centre")
+            ax2.set_title("Centreline profile above source")
+            with col2:
+                st.pyplot(fig2, clear_figure=True)
+            plt.close(fig2)
+
+            # Diagnostics
+            fig3, ax3 = plt.subplots(figsize=(6, 3))
+            keys = ["max_T_over_Ta", "mean_T_over_Ta", "vertical_centroid", "tokens_out", "tokens_sink"]
+            if "T_cap_over_Ta" in res.diagnostics:
+                keys.append("T_cap_over_Ta")
+            for key in keys:
+                ts = np.array(res.diagnostics.get(key, []))
+                if ts.size:
+                    ax3.plot(ts[:, 0], ts[:, 1], label=key)
+            ax3.set_xlabel("time step"); ax3.set_ylabel("value"); ax3.set_title("Diagnostics time series"); ax3.legend()
+            with col2:
+                st.pyplot(fig3, clear_figure=True)
+            plt.close(fig3)
+
+    # Export
+    if res is not None:
+        st.subheader("Export")
+        snaps = {f"t{t}": arr for t, arr in res.snapshots}
+        try:
+            import io
+            buf = io.BytesIO()
+            np.savez_compressed(buf, **snaps)
+            st.download_button("Download snapshots (npz)", data=buf.getvalue(), file_name="plume_snapshots.npz", mime="application/zip")
+        except Exception as e:
+            st.warning(f"Could not package snapshots: {e}")
