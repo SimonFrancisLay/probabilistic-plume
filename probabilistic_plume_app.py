@@ -990,4 +990,4 @@ with tab_res:
             np.savez_compressed(buf, **snaps)
             st.download_button("Download snapshots (npz)", data=buf.getvalue(), file_name="plume_snapshots.npz", mime="application/zip")
         except Exception as e:
-            st.warning(f"Could not package snapshots: {e
+            st.warning(f"Could not package snapshots: {e}/")
