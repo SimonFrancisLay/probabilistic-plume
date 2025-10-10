@@ -763,7 +763,7 @@ tab_run, tab_bar, tab_res = st.tabs(["Run", "Barriers", "Results"])
 with tab_run:
     st.header("Run controls")
 
-    with st.expander("Basic setup", expanded=False):
+    with st.expander("Basic setup", expanded=True):
         cols = st.columns([1,1,1,1])
         with cols[0]:
             N   = st.number_input("Grid size N", min_value=21, max_value=401, value=int(_defaults.get("N", 99)), step=2)
@@ -827,7 +827,13 @@ with tab_run:
             "Boundary mode", ["Outflow", "Blocked", "Periodic"],
             index=["Outflow","Blocked","Periodic"].index(_defaults.get("boundary_mode","Outflow"))
         )
-        cmap_name, gamma, epsilon_diffusion = color_and_diffusion_controls()
+        # Diffusion only here, colour mapping moved to Results tab
+        epsilon_diffusion = st.slider(
+            "Background diffusion ε",
+            min_value=0.0, max_value=0.2,
+            value=float(_defaults.get("epsilon_diffusion", 0.01)), step=0.005,
+            help="Moore neighbour averaging per step. Set to 0 to disable."
+        )
 
         st.markdown("---")
         st.markdown("**Incompressible cap**")
@@ -842,7 +848,13 @@ with tab_run:
         seed = st.number_input("Random seed", min_value=0, value=int(_defaults.get("seed", 42)))
 
     # Run button at the bottom, unchanged logic
-    if st.button("Run simulation", type="primary"):
+    btn_cols = st.columns([1,1])
+    with btn_cols[0]:
+        run_clicked = st.button("Run simulation", type="primary")
+    with btn_cols[1]:
+        st.button("Stop", on_click=request_stop)
+
+    if run_clicked:
         st.session_state.stop_requested = False
         params = SimParams(
             N=int(N), T_a=float(T_a), k=float(k), steps=int(steps), seed=int(seed), snapshot_stride=int(snapshot_stride),
@@ -896,6 +908,11 @@ with tab_bar:
 
 with tab_res:
     st.header("Results")
+    # Display controls live on Results tab
+    disp_cols = st.columns([1,3])
+    with disp_cols[0]:
+        st.subheader("Display")
+        cmap_name_sel
     res: Optional[SimResults] = st.session_state.get("results")
     col1, col2 = st.columns([2, 1])
 
@@ -973,4 +990,4 @@ with tab_res:
             np.savez_compressed(buf, **snaps)
             st.download_button("Download snapshots (npz)", data=buf.getvalue(), file_name="plume_snapshots.npz", mime="application/zip")
         except Exception as e:
-            st.warning(f"Could not package snapshots: {e}")
+            st.warning(f"Could not package snapshots: {e
