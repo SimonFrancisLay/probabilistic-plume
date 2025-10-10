@@ -9,16 +9,11 @@ Hardened for large grids and hot cores:
 - Probability vectors sanitised before sampling
 - Fixed colour scale in live and snapshot views, plotted as T/T_a in [1, k]
 
-Features
-- Exponential dT weighting with directional priors and distance penalty
-- Temperature dependent vertical tilt with lateral clamp
-  up: xV, up-diagonals: x0.7 V, down and lateral: divided by V, where V = exp(mu * max(T/T_a - 1, 0))
-- Source schedules and a centered source strip one cell tall, spanning a percent of width
-- Gravity dependent source and barrier defaults
-- Boundary modes: Outflow, Blocked, Periodic
-- Rectangular adiabatic barrier mask
-- Optional background diffusion after stochastic transfer
-- Progress bar, live updates, snapshots, diagnostics, export
+Barriers UI (Phase 1):
+- Multiple barriers editable via a table (Line or Rect)
+- Global thickness slider, optional per-barrier override
+- Mask is the union of all enabled rows
+- White barrier rendering in both live and snapshot plots
 
 Run locally:
 1) pip install -r requirements.txt
@@ -82,7 +77,10 @@ class SimParams:
     epsilon_diffusion: float = 0.01
     # Boundaries
     boundary_mode: str = "Outflow"     # Outflow, Blocked, Periodic
-    # Adiabatic barrier block
+
+    # Legacy single-rectangle barrier fields retained for backward compatibility,
+    # but Phase 1 UI uses a multi-row table. If the table is empty and this flag
+    # is on, we can still fall back to this rectangle.
     barrier_enabled: bool = False
     barrier_y0: int = 50
     barrier_y1: int = 70
@@ -180,12 +178,15 @@ def _distance_penalty(p: SimParams) -> Dict[str, float]:
 
 
 def compute_flux_weights(Tp: float, Tn: Dict[str, float], *, params: SimParams) -> Dict[str, float]:
+    """Directional weights, overflow safe.
+    Up xV, up-diagonals x0.7 V, down and lateral divided by V. Uses expm1 and clamps exponent args.
+    """
     eps = max(0.0, params.epsilon_baseline)
     lam_eff = params.lambda_per_Ta / max(params.T_a, 1e-12)
 
-    # --- vertical tilt ---
+    # Vertical tilt with clamp, disabled when gravity is off
     if params.disable_gravity:
-        V = 1.0  # no vertical preference
+        V = 1.0
     else:
         rel = max(Tp / max(params.T_a, 1e-12) - 1.0, 0.0)
         tilt_arg = np.clip(params.mu_vertical_tilt * rel, 0.0, 50.0)
@@ -199,7 +200,7 @@ def compute_flux_weights(Tp: float, Tn: Dict[str, float], *, params: SimParams) 
     down_dirs     = {"down", "down_left", "down_right"}
     lateral_dirs  = {"left", "right"}
 
-    w = {}
+    w: Dict[str, float] = {}
     for d, Tdj in Tn.items():
         if d not in P:
             continue
@@ -208,7 +209,6 @@ def compute_flux_weights(Tp: float, Tn: Dict[str, float], *, params: SimParams) 
         g = np.expm1(arg)
         weight = (eps + g) * P[d] * C.get(d, 1.0)
 
-        # Only apply V if gravity is enabled
         if not params.disable_gravity:
             if d in up_dirs:
                 weight *= V
@@ -225,65 +225,129 @@ def compute_flux_weights(Tp: float, Tn: Dict[str, float], *, params: SimParams) 
     return w
 
 # =============================
-# Barrier helpers and defaults
+# Barrier UI helpers (Phase 1)
 # =============================
 
-def compute_default_barrier(N: int, *, gravity_on: bool) -> Tuple[int, int, int, int]:
-    """Return default barrier block extents depending on gravity state.
-    gravity_on: place barrier starting at mid height and extend upward by about 5 percent N.
-    gravity_off: keep prior behaviour placed midway between centre and top.
-    """
-    if N <= 0:
-        return 0, 0, 0, 0
-    thickness = max(1, int(round(0.05 * N)))
-    x0 = int(round(0.25 * (N - 1)))
-    x1 = int(round((2.0 / 3.0) * (N - 1)))
-    x0 = max(0, min(N - 1, x0))
-    x1 = max(0, min(N - 1, x1))
-
+def default_barrier_rows(N: int, *, gravity_on: bool, thickness: int) -> List[Dict]:
+    """Seed a sensible default based on gravity setting."""
+    thickness = int(max(1, thickness))
     if gravity_on:
-        y0 = N // 2
-        y1 = min(N - 1, y0 + thickness - 1)
+        # Horizontal line starting at mid-height, spanning 1/4 to 2/3 width
+        i = N // 2
+        j0 = int(round(0.25 * (N - 1)))
+        j1 = int(round((2.0 / 3.0) * (N - 1)))
+        return [{"type": "Line", "i0": i, "j0": j0, "i1": i, "j1": j1, "thickness": thickness, "enabled": True}]
     else:
+        # Rect block halfway between centre and top, 5 percent thick, same width span
         centre = N // 2
         top = N - 1
         mid = int(round((centre + top) / 2))
-        y0 = max(0, min(N - 1, mid - thickness // 2))
-        y1 = max(0, min(N - 1, y0 + thickness - 1))
-
-    if y1 < y0:
-        y1 = y0
-    if x1 < x0:
-        x1 = x0
-    return y0, y1, x0, x1
+        h = max(1, int(round(0.05 * N)))
+        y0 = max(0, min(N - 1, mid - h // 2))
+        y1 = max(0, min(N - 1, y0 + h - 1))
+        j0 = int(round(0.25 * (N - 1)))
+        j1 = int(round((2.0 / 3.0) * (N - 1)))
+        return [{"type": "Rect", "i0": y0, "j0": j0, "i1": y1, "j1": j1, "thickness": thickness, "enabled": True}]
 
 
-def ensure_barrier_state_defaults(N: int, *, gravity_on: bool) -> None:
-    # Recompute defaults when grid size or gravity state changes, or if missing
+def ensure_barrier_rows_defaults(N: int, *, gravity_on: bool, thickness: int) -> None:
+    if "barrier_rows" not in st.session_state:
+        st.session_state.barrier_rows = default_barrier_rows(N, gravity_on=gravity_on, thickness=thickness)
     if "prev_N" not in st.session_state:
         st.session_state.prev_N = int(N)
     if "prev_gravity_on" not in st.session_state:
         st.session_state.prev_gravity_on = bool(gravity_on)
-    missing = any(k not in st.session_state for k in ("barrier_y0", "barrier_y1", "barrier_x0", "barrier_x1"))
-    if missing or st.session_state.prev_N != int(N) or st.session_state.prev_gravity_on != bool(gravity_on):
+    if st.session_state.prev_N != int(N) or st.session_state.prev_gravity_on != bool(gravity_on):
         st.session_state.prev_N = int(N)
         st.session_state.prev_gravity_on = bool(gravity_on)
-        by0, by1, bx0, bx1 = compute_default_barrier(int(N), gravity_on=bool(gravity_on))
-        st.session_state.barrier_y0 = by0
-        st.session_state.barrier_y1 = by1
-        st.session_state.barrier_x0 = bx0
-        st.session_state.barrier_x1 = bx1
+        st.session_state.barrier_rows = default_barrier_rows(N, gravity_on=gravity_on, thickness=thickness)
 
+
+def _bresenham(i0: int, j0: int, i1: int, j1: int) -> List[Tuple[int, int]]:
+    """Integer line rasterisation, inclusive of endpoints."""
+    points: List[Tuple[int, int]] = []
+    di = abs(i1 - i0)
+    dj = abs(j1 - j0)
+    si = 1 if i0 < i1 else -1
+    sj = 1 if j0 < j1 else -1
+    i, j = i0, j0
+    if dj <= di:
+        err = di // 2
+        while True:
+            points.append((i, j))
+            if i == i1 and j == j1:
+                break
+            i += si
+            err -= dj
+            if err < 0:
+                j += sj
+                err += di
+    else:
+        err = dj // 2
+        while True:
+            points.append((i, j))
+            if i == i1 and j == j1:
+                break
+            j += sj
+            err -= di
+            if err < 0:
+                i += si
+                err += dj
+    return points
+
+
+def _apply_thickness(mask: np.ndarray, cells: List[Tuple[int, int]], radius: int) -> None:
+    """Dilate by Chebyshev radius around each cell."""
+    N = mask.shape[0]
+    r = max(0, int(radius))
+    if r == 0:
+        for i, j in cells:
+            if 0 <= i < N and 0 <= j < N:
+                mask[i, j] = True
+        return
+    for i, j in cells:
+        i0 = max(0, i - r); i1 = min(N - 1, i + r)
+        j0 = max(0, j - r); j1 = min(N - 1, j + r)
+        mask[i0:i1+1, j0:j1+1] = True
+
+
+def build_barrier_mask_from_rows(N: int, rows: List[Dict], default_thickness: int) -> Optional[np.ndarray]:
+    if not rows:
+        return None
+    m = np.zeros((N, N), dtype=bool)
+    for row in rows:
+        if not row.get("enabled", True):
+            continue
+        typ = str(row.get("type", "Line"))
+        i0 = int(np.clip(row.get("i0", 0), 0, N-1))
+        j0 = int(np.clip(row.get("j0", 0), 0, N-1))
+        i1 = int(np.clip(row.get("i1", i0), 0, N-1))
+        j1 = int(np.clip(row.get("j1", j0), 0, N-1))
+        thick = int(row.get("thickness", default_thickness))
+        thick = max(1, thick)
+        radius = (thick - 1) // 2
+        if typ.lower().startswith("line"):
+            pts = _bresenham(i0, j0, i1, j1)
+            _apply_thickness(m, pts, radius)
+        elif typ.lower().startswith("rect"):
+            cells = [(i, j) for i in range(min(i0, i1), max(i0, i1)+1)
+                              for j in range(min(j0, j1), max(j0, j1)+1)]
+            _apply_thickness(m, cells, radius)
+    return m if m.any() else None
+
+# Backward compatible builder: prefer table, else legacy rectangle
 
 def build_barrier_mask(N: int, p: SimParams) -> Optional[np.ndarray]:
+    rows = st.session_state.get("barrier_rows", [])
+    m = build_barrier_mask_from_rows(N, rows, st.session_state.get("barrier_thickness", 1))
+    if m is not None:
+        return m
     if not p.barrier_enabled:
         return None
     y0 = int(np.clip(min(p.barrier_y0, p.barrier_y1), 0, N-1))
     y1 = int(np.clip(max(p.barrier_y0, p.barrier_y1), 0, N-1))
     x0 = int(np.clip(min(p.barrier_x0, p.barrier_x1), 0, N-1))
     x1 = int(np.clip(max(p.barrier_x0, p.barrier_x1), 0, N-1))
-    if y1 < y0 or x1 < x0:
-        return None
     mask = np.zeros((N, N), dtype=bool)
     mask[y0:y1+1, x0:x1+1] = True
     return mask
@@ -472,21 +536,20 @@ def run_simulation(
                 if live_mask is not None:
                     live_data = np.ma.array(live_data, mask=live_mask)
 
-                # Use chosen cmap and paint barrier as white
-                cmap_live = plt.get_cmap(cmap_name).copy()
+                cmap_live = plt.get_cmap(st.session_state.get("cmap_name_live", "inferno")).copy()
                 try:
                     cmap_live.set_bad(color="white")
                 except Exception:
                     pass
 
-                norm_live = PowerNorm(gamma=gamma, vmin=1.0, vmax=params.k)
+                norm_live = PowerNorm(gamma=st.session_state.get("gamma_live", 1.0), vmin=1.0, vmax=params.k)
 
                 im = ax_live.imshow(
                     live_data,
                     origin="lower",
                     interpolation="nearest",
                     cmap=cmap_live,
-                    norm=norm_live,  # limits inside norm, no vmin or vmax here
+                    norm=norm_live,
                 )
                 ax_live.set_title(f"Live field at t = {t}  (T/T_a fixed scale)")
                 fig_live.colorbar(im, ax=ax_live, fraction=0.046, pad=0.04, label="T/T_a")
@@ -501,20 +564,60 @@ def run_simulation(
 # UI helpers
 # =============================
 
-def barrier_controls(N: int) -> Tuple[bool, int, int, int, int]:
-    st.subheader("Adiabatic barrier block")
-    barrier_enabled = st.checkbox("Enable rectangular barrier", value=False)
-    y0 = st.number_input("Barrier bottom row i0 (0=bottom)", min_value=0, max_value=int(N - 1), value=int(st.session_state.barrier_y0))
-    y1 = st.number_input("Barrier top row i1", min_value=0, max_value=int(N - 1), value=int(st.session_state.barrier_y1))
-    x0 = st.number_input("Barrier left col j0", min_value=0, max_value=int(N - 1), value=int(st.session_state.barrier_x0))
-    x1 = st.number_input("Barrier right col j1", min_value=0, max_value=int(N - 1), value=int(st.session_state.barrier_x1))
-    return bool(barrier_enabled), int(y0), int(y1), int(x0), int(x1)
+def barrier_table_editor(N: int, gravity_on: bool) -> None:
+    st.subheader("Barriers (Phase 1)")
+    # Global thickness default
+    bt = st.slider("Global barrier thickness (cells)", 1, 9, st.session_state.get("barrier_thickness", 1), step=1)
+    st.session_state.barrier_thickness = int(bt)
+    ensure_barrier_rows_defaults(N, gravity_on=gravity_on, thickness=st.session_state.barrier_thickness)
+
+    rows = st.session_state.barrier_rows
+
+    colconf = {
+        "type": st.column_config.SelectboxColumn("type", options=["Line", "Rect"], width="small"),
+        "i0": st.column_config.NumberColumn("i0", step=1, min_value=0, max_value=N-1),
+        "j0": st.column_config.NumberColumn("j0", step=1, min_value=0, max_value=N-1),
+        "i1": st.column_config.NumberColumn("i1", step=1, min_value=0, max_value=N-1),
+        "j1": st.column_config.NumberColumn("j1", step=1, min_value=0, max_value=N-1),
+        "thickness": st.column_config.NumberColumn("thickness", step=1, min_value=1, max_value=25),
+        "enabled": st.column_config.CheckboxColumn("enabled", default=True),
+    }
+
+    edited = st.data_editor(rows, num_rows="dynamic", column_config=colconf, use_container_width=True, key="barrier_rows_editor")
+    # Normalise edited rows into basic python list of dicts (Streamlit returns list[dict])
+    st.session_state.barrier_rows = [
+        {
+            "type": r.get("type", "Line"),
+            "i0": int(r.get("i0", 0) or 0),
+            "j0": int(r.get("j0", 0) or 0),
+            "i1": int(r.get("i1", 0) or 0),
+            "j1": int(r.get("j1", 0) or 0),
+            "thickness": int(r.get("thickness", st.session_state.barrier_thickness) or st.session_state.barrier_thickness),
+            "enabled": bool(r.get("enabled", True)),
+        }
+        for r in edited
+    ]
+
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        if st.button("Add default barrier"):
+            st.session_state.barrier_rows += default_barrier_rows(N, gravity_on=gravity_on, thickness=st.session_state.barrier_thickness)
+    with c2:
+        if st.button("Clear all barriers"):
+            st.session_state.barrier_rows = []
+    with c3:
+        if st.button("Disable all (keep rows)"):
+            for r in st.session_state.barrier_rows:
+                r["enabled"] = False
 
 
 def color_and_diffusion_controls() -> Tuple[str, float, float]:
     st.subheader("Color mapping")
-    cmap_name = st.selectbox("Colormap", ["inferno", "magma", "viridis", "plasma", "cividis"], index=0)
-    gamma = st.slider("Contrast (gamma)", min_value=0.3, max_value=2.0, value=1.0, step=0.1)
+    cmap_name = st.selectbox("Colormap", ["inferno", "magma", "viridis", "plasma", "cividis"], index=0, key="cmap_select")
+    gamma = st.slider("Contrast (gamma)", min_value=0.3, max_value=2.0, value=1.0, step=0.1, key="gamma_slider")
+    # cache for live view
+    st.session_state.cmap_name_live = cmap_name
+    st.session_state.gamma_live = gamma
     st.subheader("Background diffusion")
     epsilon_diffusion = st.slider("Background diffusion ε", min_value=0.0, max_value=0.2, value=0.01, step=0.005)
     return str(cmap_name), float(gamma), float(epsilon_diffusion)
@@ -530,7 +633,7 @@ def request_stop():
     st.session_state.stop_requested = True
 
 st.title("Probabilistic buoyant plume: stochastic token flux")
-st.caption("Toggle between per token sampling and single-shot multinomial allocation. Overflow safe and fixed colour scale.")
+st.caption("Per token vs multinomial sampling, overflow-safe numerics, fixed colour scale, and Phase 1 barrier editor.")
 
 with st.sidebar:
     st.header("Controls")
@@ -572,9 +675,8 @@ with st.sidebar:
 
     boundary_mode = st.selectbox("Boundary mode", ["Outflow", "Blocked", "Periodic"], index=0)
 
-    # Ensure barrier defaults now that N is known
-    ensure_barrier_state_defaults(int(N), gravity_on=not bool(disable_gravity))
-    barrier_enabled, barrier_y0, barrier_y1, barrier_x0, barrier_x1 = barrier_controls(int(N))
+    # Phase 1 barrier controls
+    barrier_table_editor(int(N), gravity_on=not bool(disable_gravity))
 
     cmap_name, gamma, epsilon_diffusion = color_and_diffusion_controls()
 
@@ -587,7 +689,10 @@ with st.sidebar:
     stop_btn = st.button("Stop", on_click=request_stop)
     run_btn  = st.button("Run simulation", type="primary")
 
-# Session storage
+# =============================
+# Session and run
+# =============================
+
 if "params" not in st.session_state:
     st.session_state.params = None
 if "results" not in st.session_state:
@@ -603,7 +708,8 @@ if run_btn:
         lambda_per_Ta=float(lambda_per_Ta), distance_penalty=bool(distance_penalty), disable_gravity=bool(disable_gravity),
         mu_vertical_tilt=float(mu_vertical_tilt), eta_token_quanta=float(eta_token_quanta), sampling_mode=str(sampling_mode),
         epsilon_diffusion=float(epsilon_diffusion), boundary_mode=str(boundary_mode),
-        barrier_enabled=bool(barrier_enabled), barrier_y0=int(barrier_y0), barrier_y1=int(barrier_y1), barrier_x0=int(barrier_x0), barrier_x1=int(barrier_x1),
+        # legacy barrier fields retained but not used when table is non-empty
+        barrier_enabled=False,
     )
     st.session_state.params = params
 
@@ -653,8 +759,12 @@ else:
         data = (T_sel / res.params.T_a).copy()
         if barrier_mask_plot is not None:
             data = np.ma.array(data, mask=barrier_mask_plot)
-        cmap = plt.get_cmap(cmap_name).copy(); cmap.set_bad(color="white")
-        norm = PowerNorm(gamma=gamma, vmin=1.0, vmax=res.params.k)
+        cmap = plt.get_cmap(st.session_state.get("cmap_name_live", "inferno")).copy();
+        try:
+            cmap.set_bad(color="white")
+        except Exception:
+            pass
+        norm = PowerNorm(gamma=st.session_state.get("gamma_live", 1.0), vmin=1.0, vmax=res.params.k)
 
         fig1, ax1 = plt.subplots(figsize=(6, 6))
         im = ax1.imshow(
@@ -662,7 +772,7 @@ else:
             origin="lower",
             interpolation="nearest",
             cmap=cmap,
-            norm=norm,   # limits are inside norm
+            norm=norm,
         )
         ax1.set_title(f"Field at t = {t_sel} (T/T_a, fixed scale)")
         ax1.set_xlabel("x index"); ax1.set_ylabel("y index")
