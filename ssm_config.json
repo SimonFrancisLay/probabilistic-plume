@@ -1,0 +1,38 @@
+{
+  "app_defaults": {
+    "N": 99,
+    "T_a": 20.0,
+    "k": 5.0,
+    "steps": 200,
+    "snapshot_stride": 10,
+    "source_mode": "Grow-plateau-decay",
+    "tau_g": 20.0,
+    "plateau_steps": 50,
+    "tau_d": 40.0,
+    "source_span_pct": 5.0,
+    "allow_diagonals": true,
+    "epsilon_baseline": 0.005,
+    "lambda_per_Ta": 1.8,
+    "distance_penalty": true,
+    "disable_gravity": false,
+    "mu_vertical_tilt": 1.5,
+    "eta_token_quanta": 0.001,
+    "sampling_mode": "Per token",
+    "boundary_mode": "Outflow",
+    "epsilon_diffusion": 0.01,
+    "cap_enabled": true,
+    "cap_softness_per_Ta": 0.2,
+    "cmap_name": "inferno",
+    "gamma": 1.0,
+    "live_update_stride": 10,
+    "seed": 42
+  },
+  "barriers": {
+    "enabled": true,
+    "rows": [
+      { "type": "Line", "mode": "Solid", "j0": 24, "i0": 49, "j1": 65, "i1": 49, "thickness": 1, "enabled": true },
+      { "type": "Line", "mode": "Solid", "j0": 24, "i0": 40, "j1": 65, "i1": 40, "thickness": 1, "enabled": true },
+      { "type": "Rect", "mode": "Hole",  "j0": 35, "i0": 39, "j1": 45, "i1": 42, "thickness": 1, "enabled": true }
+    ]
+  }
+}

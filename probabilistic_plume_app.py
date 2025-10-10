@@ -323,46 +323,16 @@ def ensure_barrier_rows_defaults(N: int, *, gravity_on: bool) -> None:
 
 
 def build_barrier_mask_from_rows(N: int, rows: List[Dict]) -> Optional[np.ndarray]:
-    """Build mask from table rows in input order.
-      • Only rows with enabled==True and complete fields are used
-      • type: Line or Rect
-      • mode: Solid -> add barrier; Hole -> carve hole
-      • thickness: positive integer, centred on the centreline
-    """
     if not rows:
         return None
-
-    def _to_int(x):
-        try:
-            return int(x)
-        except Exception:
-            return None
-
-    def _row_complete(r: Dict) -> bool:
-        if not r.get("enabled", False):
-            return False
-        # All of these must parse to ints within bounds
-        needed = ["j0", "i0", "j1", "i1", "thickness"]
-        parsed = {k: _to_int(r.get(k)) for k in needed}
-        if any(v is None for v in parsed.values()):
-            return False
-        j0, i0, j1, i1, thick = parsed["j0"], parsed["i0"], parsed["j1"], parsed["i1"], parsed["thickness"]
-        if not (0 <= i0 < N and 0 <= i1 < N and 0 <= j0 < N and 0 <= j1 < N):
-            return False
-        if thick is None or thick < 1:
-            return False
-        return True
-
     mask = np.zeros((N, N), dtype=bool)
 
     def draw_row(target: np.ndarray, row: Dict, value: bool) -> None:
-        # Safe parsing now that row is complete
         typ = str(row.get("type", "Line"))
-        j0 = int(row["j0"]); i0 = int(row["i0"])
-        j1 = int(row["j1"]); i1 = int(row["i1"])
-        thick = max(1, int(row["thickness"]))
+        j0 = int(np.clip(row.get("j0", 0), 0, N - 1)); i0 = int(np.clip(row.get("i0", 0), 0, N - 1))
+        j1 = int(np.clip(row.get("j1", j0), 0, N - 1)); i1 = int(np.clip(row.get("i1", i0), 0, N - 1))
+        thick = max(1, int(row.get("thickness", 1) or 1))
         radius = (thick - 1) // 2
-
         if typ.lower().startswith("line"):
             pts = _bresenham(i0, j0, i1, j1)
             _apply_thickness(target, pts, radius, value)
@@ -371,9 +341,8 @@ def build_barrier_mask_from_rows(N: int, rows: List[Dict]) -> Optional[np.ndarra
                               for j in range(min(j0, j1), max(j0, j1) + 1)]
             _apply_thickness(target, cells, radius, value)
 
-    # Apply in input order, but only complete+enabled rows
     for row in rows:
-        if not _row_complete(row):
+        if not row.get("enabled", True):
             continue
         mode = str(row.get("mode", "Solid")).lower()
         draw_row(mask, row, False if mode == "hole" else True)
@@ -381,12 +350,27 @@ def build_barrier_mask_from_rows(N: int, rows: List[Dict]) -> Optional[np.ndarra
     return mask if mask.any() else None
 
 
+def build_barrier_mask(N: int, p: SimParams) -> Optional[np.ndarray]:
+    rows = st.session_state.get("barrier_rows", [])
+    m = build_barrier_mask_from_rows(N, rows)
+    if m is not None:
+        return m
+    if not p.barrier_enabled:
+        return None
+    y0 = int(np.clip(min(p.barrier_y0, p.barrier_y1), 0, N-1))
+    y1 = int(np.clip(max(p.barrier_y0, p.barrier_y1), 0, N-1))
+    x0 = int(np.clip(min(p.barrier_x0, p.barrier_x1), 0, N-1))
+    x1 = int(np.clip(max(p.barrier_x0, p.barrier_x1), 0, N-1))
+    mask = np.zeros((N, N), dtype=bool)
+    mask[y0:y1+1, x0:x1+1] = True
+    return mask
+
+
 def barrier_table_editor(N: int, gravity_on: bool) -> None:
     st.subheader("Barriers (Phase 1)")
     ensure_barrier_rows_defaults(N, gravity_on=gravity_on)
     rows = st.session_state.barrier_rows
 
-    # New rows default to enabled=False to avoid preview/runs using half-filled rows
     colconf = {
         "type": st.column_config.SelectboxColumn("type", options=["Line", "Rect"], width="small"),
         "mode": st.column_config.SelectboxColumn("mode", options=["Solid", "Hole"], width="small"),
@@ -395,54 +379,23 @@ def barrier_table_editor(N: int, gravity_on: bool) -> None:
         "j1": st.column_config.NumberColumn("j1 (x1)", step=1, min_value=0, max_value=N-1),
         "i1": st.column_config.NumberColumn("i1 (y1)", step=1, min_value=0, max_value=N-1),
         "thickness": st.column_config.NumberColumn("thickness (cells)", step=1, min_value=1, max_value=25),
-        "enabled": st.column_config.CheckboxColumn("enabled", default=False),
+        "enabled": st.column_config.CheckboxColumn("enabled", default=True),
     }
 
-    edited = st.data_editor(
-        rows,
-        num_rows="dynamic",
-        column_config=colconf,
-        use_container_width=True,
-        key="barrier_rows_editor",
-    )
+    edited = st.data_editor(rows, num_rows="dynamic", column_config=colconf,
+                            use_container_width=True, key="barrier_rows_editor")
 
-    # Keep rows as-is, but coerce types where present; do not fail on blanks
-    def _safe_int(x, default=None):
-        try:
-            return int(x)
-        except Exception:
-            return default
+    st.session_state.barrier_rows = [{
+        "type": r.get("type", "Line"),
+        "mode": r.get("mode", "Solid"),
+        "j0": int(r.get("j0", 0) or 0),
+        "i0": int(r.get("i0", 0) or 0),
+        "j1": int(r.get("j1", 0) or 0),
+        "i1": int(r.get("i1", 0) or 0),
+        "thickness": max(1, int(r.get("thickness", 1) or 1)),
+        "enabled": bool(r.get("enabled", True)),
+    } for r in edited]
 
-    cleaned: List[Dict] = []
-    for r in edited:
-        cleaned.append({
-            "type": r.get("type", "Line"),
-            "mode": r.get("mode", "Solid"),
-            "j0": _safe_int(r.get("j0")),
-            "i0": _safe_int(r.get("i0")),
-            "j1": _safe_int(r.get("j1")),
-            "i1": _safe_int(r.get("i1")),
-            "thickness": max(1, _safe_int(r.get("thickness"), 1) or 1),
-            "enabled": bool(r.get("enabled", False)),
-        })
-    st.session_state.barrier_rows = cleaned
-
-    c1, c2, c3 = st.columns(3)
-    with c1:
-        if st.button("Add default barrier"):
-            # Insert a ready-to-use row that is enabled=True by design
-            st.session_state.barrier_rows += [
-                {**default_barrier_rows(N, gravity_on=gravity_on)[0], "enabled": True}
-            ]
-    with c2:
-        if st.button("Clear all barriers"):
-            st.session_state.barrier_rows = []
-    with c3:
-        if st.button("Disable all (keep rows)"):
-            for r in st.session_state.barrier_rows:
-                r["enabled"] = False
-
-    # Preview draws only enabled+complete rows, so it stays quiet while editing
     with st.expander("Barrier preview", expanded=False):
         try:
             preview_rows = st.session_state.get("barrier_rows", [])
@@ -450,7 +403,7 @@ def barrier_table_editor(N: int, gravity_on: bool) -> None:
             if HAVE_MPL:
                 fig_prev, ax_prev = plt.subplots(figsize=(3, 3))
                 if preview_mask is None:
-                    ax_prev.text(0.5, 0.5, "No enabled barriers", ha="center", va="center")
+                    ax_prev.text(0.5, 0.5, "No barriers", ha="center", va="center")
                     ax_prev.set_axis_off()
                 else:
                     ax_prev.imshow(preview_mask, origin="lower", interpolation="nearest", cmap="gray_r")
