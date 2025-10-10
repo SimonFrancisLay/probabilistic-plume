@@ -4,6 +4,7 @@ SSM model: Stochastic Smoke Model, full Streamlit app
 - Barriers Phase 1 editor with Solid or Hole rows, ordered application
 - Fixed colour scale for T/T_a in live and snapshots
 - Gravity aware source placement and defaults
+- Optional incompressible cap: soft back pressure plus final clamp
 
 Run locally:
   pip install -r requirements.txt
@@ -73,6 +74,9 @@ class SimParams:
     barrier_y1: int = 70
     barrier_x0: int = 20
     barrier_x1: int = 80
+    # Incompressible cap
+    cap_enabled: bool = False
+    cap_softness_per_Ta: float = 0.2   # delta relative to T_a for soft back pressure
 
 
 @dataclass
@@ -166,7 +170,29 @@ def _distance_penalty(p: SimParams) -> Dict[str, float]:
     return {"up": 1.0, "down": 1.0, "left": 1.0, "right": 1.0, "up_left": diag, "up_right": diag, "down_left": diag, "down_right": diag}
 
 
-def compute_flux_weights(Tp: float, Tn: Dict[str, float], *, params: SimParams) -> Dict[str, float]:
+def _backpressure_factor(Tn: float, T_cap: float, delta: float) -> float:
+    """Smooth acceptance reduction as neighbor nears or exceeds cap.
+    factor = 1 / (1 + exp((Tn - T_cap) / delta)) so that:
+      Tn << T_cap  -> factor ~ 1
+      Tn =  T_cap  -> factor = 0.5
+      Tn >> T_cap  -> factor ~ 0
+    """
+    if delta <= 0.0:
+        return 0.0 if Tn >= T_cap else 1.0
+    z = (Tn - T_cap) / delta
+    # clamp z to avoid overflow
+    z = float(np.clip(z, -50.0, 50.0))
+    return 1.0 / (1.0 + np.exp(z))
+
+
+def compute_flux_weights(
+    Tp: float,
+    Tn: Dict[str, float],
+    *,
+    params: SimParams,
+    T_cap: Optional[float] = None,
+    delta_soft: Optional[float] = None,
+) -> Dict[str, float]:
     eps = max(0.0, params.epsilon_baseline)
     lam_eff = params.lambda_per_Ta / max(params.T_a, 1e-12)
 
@@ -186,6 +212,8 @@ def compute_flux_weights(Tp: float, Tn: Dict[str, float], *, params: SimParams) 
     down_dirs     = {"down", "down_left", "down_right"}
     lateral_dirs  = {"left", "right"}
 
+    use_cap = params.cap_enabled and (T_cap is not None) and (delta_soft is not None)
+
     w: Dict[str, float] = {}
     for d, Tdj in Tn.items():
         if d not in P:
@@ -203,6 +231,10 @@ def compute_flux_weights(Tp: float, Tn: Dict[str, float], *, params: SimParams) 
                 weight /= V
             elif d in lateral_dirs and V > 0:
                 weight /= V
+        if use_cap:
+            # reduce acceptance if neighbor close to cap
+            factor = _backpressure_factor(Tdj, T_cap, delta_soft)
+            weight *= factor
         if not np.isfinite(weight) or weight < 0.0:
             weight = 0.0
         w[d] = float(weight)
@@ -414,7 +446,15 @@ def background_diffuse(T: np.ndarray, params: SimParams, barrier_mask: Optional[
 # Stochastic token flux step (A or B)
 # =============================================================
 
-def stochastic_flux_step(T: np.ndarray, *, params: SimParams, barrier_mask: Optional[np.ndarray], rng: np.random.Generator) -> Tuple[np.ndarray, Dict[str, float]]:
+def stochastic_flux_step(
+    T: np.ndarray,
+    *,
+    params: SimParams,
+    barrier_mask: Optional[np.ndarray],
+    rng: np.random.Generator,
+    T_cap: Optional[float] = None,
+    delta_soft: Optional[float] = None,
+) -> Tuple[np.ndarray, Dict[str, float]]:
     N = params.N
     q = max(1e-12, params.eta_token_quanta * params.T_a)
     use_multinomial = (params.sampling_mode == "Multinomial")
@@ -449,7 +489,13 @@ def stochastic_flux_step(T: np.ndarray, *, params: SimParams, barrier_mask: Opti
             if not Tn:
                 continue
 
-            w = compute_flux_weights(Tij, Tn, params=params)
+            w = compute_flux_weights(
+                Tij,
+                Tn,
+                params=params,
+                T_cap=T_cap,
+                delta_soft=delta_soft,
+            )
 
             dirs = list(w.keys())
             raw = np.array([w[d] for d in dirs], dtype=np.float64)
@@ -502,6 +548,10 @@ def stochastic_flux_step(T: np.ndarray, *, params: SimParams, barrier_mask: Opti
         T_next[barrier_mask] = params.T_a
     T_next = background_diffuse(T_next, params, barrier_mask)
 
+    # Final hard clamp to cap if enabled
+    if params.cap_enabled and (T_cap is not None):
+        T_next = np.minimum(T_next, T_cap)
+
     diag: Dict[str, float] = {}
     diag["tokens_out"] = float(out_tokens)
     diag["tokens_sink"] = float(sink_tokens)
@@ -510,6 +560,8 @@ def stochastic_flux_step(T: np.ndarray, *, params: SimParams, barrier_mask: Opti
     y = np.arange(N, dtype=np.float64)
     weighted_sum = (T_next * y[:, None]).sum(); total_temp = T_next.sum()
     diag["vertical_centroid"] = float(weighted_sum / total_temp) if total_temp > 0 else float(N // 2)
+    if params.cap_enabled and (T_cap is not None):
+        diag["T_cap_over_Ta"] = float(T_cap / params.T_a)
     return T_next, diag
 
 # =============================================================
@@ -528,6 +580,10 @@ def run_simulation(
     T = init_grid(params)
     barrier_mask = build_barrier_mask(params.N, params)
 
+    # running cap uses source running max
+    T_cap_running = params.k * params.T_a if params.cap_enabled else None
+    delta_soft = params.cap_softness_per_Ta * params.T_a if params.cap_enabled else None
+
     snapshots: List[Tuple[int, np.ndarray]] = [(0, T.copy())]
     diagnostics: Dict[str, List[Tuple[int, float]]] = {
         "max_T_over_Ta": [(0, float(T.max() / params.T_a))],
@@ -536,11 +592,19 @@ def run_simulation(
         "tokens_out": [(0, 0.0)],
         "tokens_sink": [(0, 0.0)],
     }
+    if params.cap_enabled and T_cap_running is not None:
+        diagnostics["T_cap_over_Ta"] = [(0, float(T_cap_running / params.T_a))]
 
     for t in range(1, params.steps + 1):
         if stop_check is not None and stop_check():
             break
         T_source = source_multiplier(t, params) * params.T_a
+        if params.cap_enabled:
+            if T_cap_running is None:
+                T_cap_running = T_source
+            else:
+                T_cap_running = max(T_cap_running, T_source)
+
         if T_source > params.T_a + 1e-6:
             r = source_row(params.N, params.disable_gravity)
             y0, y1, x0, x1 = source_region_coords(params.N, params.source_span_frac, row=r)
@@ -552,7 +616,14 @@ def run_simulation(
             else:
                 T[y0:y1+1, x0:x1+1] = T_source
 
-        T, diag = stochastic_flux_step(T, params=params, barrier_mask=barrier_mask, rng=rng)
+        T, diag = stochastic_flux_step(
+            T,
+            params=params,
+            barrier_mask=barrier_mask,
+            rng=rng,
+            T_cap=T_cap_running,
+            delta_soft=delta_soft,
+        )
 
         if t % params.snapshot_stride == 0 or t == params.steps:
             snapshots.append((t, T.copy()))
@@ -614,7 +685,7 @@ def request_stop():
     st.session_state.stop_requested = True
 
 st.title("SSM model: stochastic smoke plume")
-st.caption("Per token vs multinomial sampling, Solid or Hole barriers, fixed T/T_a scale, gravity aware defaults.")
+st.caption("Per token vs multinomial sampling, Solid or Hole barriers, fixed T/T_a scale, gravity aware defaults, optional incompressible cap.")
 
 with st.sidebar:
     st.header("Controls")
@@ -659,6 +730,14 @@ with st.sidebar:
     # Barrier editor
     barrier_table_editor(int(N), gravity_on=not bool(disable_gravity))
 
+    st.subheader("Incompressible cap")
+    cap_enabled = st.checkbox("Enable soft cap and final clamp", value=False)
+    cap_softness_per_Ta = st.slider(
+        "Cap softness δ in units of T_a",
+        min_value=0.02, max_value=1.0, value=0.2, step=0.02,
+        help="Back pressure starts to bite as neighbors approach the running max source temp. Smaller δ is sharper.",
+    )
+
     cmap_name, gamma, epsilon_diffusion = color_and_diffusion_controls()
 
     steps           = st.number_input("Time steps", min_value=1, value=200)
@@ -687,6 +766,7 @@ if run_btn:
         mu_vertical_tilt=float(mu_vertical_tilt), eta_token_quanta=float(eta_token_quanta), sampling_mode=str(sampling_mode),
         epsilon_diffusion=float(epsilon_diffusion), boundary_mode=str(boundary_mode),
         barrier_enabled=False,
+        cap_enabled=bool(cap_enabled), cap_softness_per_Ta=float(cap_softness_per_Ta),
     )
     st.session_state.params = params
 
@@ -696,7 +776,8 @@ if run_btn:
 
     def progress_cb(t, total, diag):
         pct = int(100 * t / total)
-        txt = f"Step {t}/{total} · tokens_out={int(diag.get('tokens_out', 0))}"
+        cap_txt = f" · cap={(diag.get('T_cap_over_Ta', 0.0)):.2f} T_a" if params.cap_enabled else ""
+        txt = f"Step {t}/{total} · tokens_out={int(diag.get('tokens_out', 0))}{cap_txt}"
         prog.progress(pct, text=txt)
         status.write(txt)
 
@@ -772,7 +853,10 @@ else:
 
         # Diagnostics
         fig3, ax3 = plt.subplots(figsize=(6, 3))
-        for key in ["max_T_over_Ta", "mean_T_over_Ta", "vertical_centroid", "tokens_out", "tokens_sink"]:
+        keys = ["max_T_over_Ta", "mean_T_over_Ta", "vertical_centroid", "tokens_out", "tokens_sink"]
+        if "T_cap_over_Ta" in res.diagnostics:
+            keys.append("T_cap_over_Ta")
+        for key in keys:
             ts = np.array(res.diagnostics.get(key, []))
             if ts.size:
                 ax3.plot(ts[:, 0], ts[:, 1], label=key)
