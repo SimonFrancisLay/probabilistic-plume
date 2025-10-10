@@ -356,8 +356,7 @@ def build_barrier_mask_from_rows(N: int, rows: List[Dict]) -> Optional[np.ndarra
                 _apply_thickness(m, cells, radius, False)
     return m if m.any() else None
 
-# Backward compatible builder: prefer table, else legacy rectangle
-: prefer table, else legacy rectangle
+# Backward compatible builder: prefer table, else legacy rectangle: prefer table, else legacy rectangle
 
 def build_barrier_mask(N: int, p: SimParams) -> Optional[np.ndarray]:
     rows = st.session_state.get("barrier_rows", [])
