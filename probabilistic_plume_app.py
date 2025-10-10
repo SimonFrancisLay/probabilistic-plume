@@ -926,7 +926,23 @@ with tab_res:
     disp_cols = st.columns([1,3])
     with disp_cols[0]:
         st.subheader("Display")
-        cmap_name_sel
+        cmap_name_sel = st.selectbox(
+            "Colormap",
+            ["inferno", "magma", "viridis", "plasma", "cividis"],
+            index=["inferno","magma","viridis","plasma","cividis"].index(
+                st.session_state.get("cmap_name_live", "inferno")
+            )
+        )
+        gamma_sel = st.slider(
+            "Contrast (gamma)",
+            min_value=0.3, max_value=2.0,
+            value=float(st.session_state.get("gamma_live", 1.0)),
+            step=0.1
+        )
+        # Persist selections so both live and snapshots use them
+        st.session_state["cmap_name_live"] = cmap_name_sel
+        st.session_state["gamma_live"] = gamma_sel
+
     res: Optional[SimResults] = st.session_state.get("results")
     col1, col2 = st.columns([2, 1])
 
