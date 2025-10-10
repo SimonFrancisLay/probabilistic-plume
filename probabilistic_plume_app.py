@@ -763,7 +763,7 @@ tab_run, tab_bar, tab_res = st.tabs(["Run", "Barriers", "Results"])
 with tab_run:
     st.header("Run controls")
 
-    with st.expander("Basic setup", expanded=True):
+    with st.expander("Basic setup", expanded=False):
         cols = st.columns([1,1,1,1])
         with cols[0]:
             N   = st.number_input("Grid size N", min_value=21, max_value=401, value=int(_defaults.get("N", 99)), step=2)
