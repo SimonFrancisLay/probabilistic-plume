@@ -763,7 +763,7 @@ tab_run, tab_bar, tab_res = st.tabs(["Run", "Barriers", "Results"])
 with tab_run:
     st.header("Run controls")
 
-    with st.expander("Basic setup", expanded=True):
+    with st.expander("Basic setup", expanded=False):
         cols = st.columns([1,1,1,1])
         with cols[0]:
             N   = st.number_input("Grid size N", min_value=21, max_value=401, value=int(_defaults.get("N", 99)), step=2)
@@ -912,7 +912,23 @@ with tab_res:
     disp_cols = st.columns([1,3])
     with disp_cols[0]:
         st.subheader("Display")
-        cmap_name_sel
+        cmap_name_sel = st.selectbox(
+            "Colormap",
+            ["inferno", "magma", "viridis", "plasma", "cividis"],
+            index=["inferno","magma","viridis","plasma","cividis"].index(
+                st.session_state.get("cmap_name_live", "inferno")
+            )
+        )
+        gamma_sel = st.slider(
+            "Contrast (gamma)",
+            min_value=0.3, max_value=2.0,
+            value=float(st.session_state.get("gamma_live", 1.0)),
+            step=0.1
+        )
+        # Persist selections so both live and snapshots use them
+        st.session_state["cmap_name_live"] = cmap_name_sel
+        st.session_state["gamma_live"] = gamma_sel
+
     res: Optional[SimResults] = st.session_state.get("results")
     col1, col2 = st.columns([2, 1])
 
@@ -990,4 +1006,4 @@ with tab_res:
             np.savez_compressed(buf, **snaps)
             st.download_button("Download snapshots (npz)", data=buf.getvalue(), file_name="plume_snapshots.npz", mime="application/zip")
         except Exception as e:
-            st.warning(f"Could not package snapshots: {e}/")
+            st.warning(f"Could not package snapshots: {e}")
