@@ -3,7 +3,7 @@
     "N": 99,
     "T_a": 20.0,
     "k": 5.0,
-    "steps": 200,
+    "steps": 100,
     "snapshot_stride": 10,
     "source_mode": "Grow-plateau-decay",
     "tau_g": 20.0,
