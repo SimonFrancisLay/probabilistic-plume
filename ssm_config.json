@@ -32,7 +32,8 @@
     "rows": [
       { "type": "Line", "mode": "Solid", "j0": 24, "i0": 49, "j1": 65, "i1": 49, "thickness": 1, "enabled": true },
       { "type": "Line", "mode": "Solid", "j0": 24, "i0": 40, "j1": 65, "i1": 40, "thickness": 1, "enabled": true },
-      { "type": "Rect", "mode": "Hole",  "j0": 35, "i0": 39, "j1": 45, "i1": 42, "thickness": 1, "enabled": true }
+      { "type": "Rect", "mode": "Hole",  "j0": 35, "i0": 39, "j1": 45, "i1": 42, "thickness": 1, "enabled": true },
+      { "type": "Rect", "mode": "Hole",  "j0": 55, "i0": 48, "j1": 60, "i1": 52, "thickness": 1, "enabled": true }
     ]
   }
 }
