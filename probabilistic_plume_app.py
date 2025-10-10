@@ -322,16 +322,26 @@ def default_barrier_rows(N: int, *, gravity_on: bool) -> List[Dict]:
 
 
 def ensure_barrier_rows_defaults(N: int, *, gravity_on: bool) -> None:
-    if "barrier_rows" not in st.session_state:
-        st.session_state.barrier_rows = default_barrier_rows(N, gravity_on=gravity_on)
+    """Initialize default barrier rows.
+    - barrier_rows_edit: editable buffer shown in the editor
+    - barrier_rows_applied: last applied set used by the simulation
+    We do NOT overwrite the edit buffer on reruns once created; only reset if user hasn't edited yet.
+    """
+    if "barrier_rows_edit" not in st.session_state:
+        st.session_state.barrier_rows_edit = default_barrier_rows(N, gravity_on=gravity_on)
+    if "barrier_rows_applied" not in st.session_state:
+        st.session_state.barrier_rows_applied = [r.copy() for r in st.session_state.barrier_rows_edit]
     if "prev_N" not in st.session_state:
         st.session_state.prev_N = int(N)
     if "prev_gravity_on" not in st.session_state:
         st.session_state.prev_gravity_on = bool(gravity_on)
+
     if st.session_state.prev_N != int(N) or st.session_state.prev_gravity_on != bool(gravity_on):
         st.session_state.prev_N = int(N)
         st.session_state.prev_gravity_on = bool(gravity_on)
-        st.session_state.barrier_rows = default_barrier_rows(N, gravity_on=gravity_on)
+        if not st.session_state.get("barrier_rows_user_edited", False):
+            st.session_state.barrier_rows_edit = default_barrier_rows(N, gravity_on=gravity_on)
+            st.session_state.barrier_rows_applied = [r.copy() for r in st.session_state.barrier_rows_edit]
 
 
 def _safe_int(x, default=None):
@@ -411,9 +421,14 @@ def build_barrier_mask(N: int, p: SimParams) -> Optional[np.ndarray]:
 
 
 def barrier_table_editor(N: int, gravity_on: bool) -> None:
+    """Barrier editor with buffered editing.
+    Users edit `barrier_rows_edit`; simulation uses `barrier_rows_applied`.
+    Nothing is applied until the user clicks the Apply button.
+    """
     st.subheader("Barrier designer")
     ensure_barrier_rows_defaults(N, gravity_on=gravity_on)
-    rows = st.session_state.barrier_rows
+
+    rows_edit = st.session_state.barrier_rows_edit
 
     colconf = {
         "type": st.column_config.SelectboxColumn("type", options=["Line", "Rect"], width="small"),
@@ -427,7 +442,7 @@ def barrier_table_editor(N: int, gravity_on: bool) -> None:
     }
 
     edited = st.data_editor(
-        rows,
+        rows_edit,
         num_rows="dynamic",
         column_config=colconf,
         key="barrier_rows_editor",
@@ -435,10 +450,9 @@ def barrier_table_editor(N: int, gravity_on: bool) -> None:
         hide_index=True,
     )
 
-    # Clean without forcing ints until present; leave None for partial edits
-    cleaned: List[Dict] = []
+    cleaned_edit: List[Dict] = []
     for r in edited:
-        cleaned.append({
+        cleaned_edit.append({
             "type": r.get("type", "Line"),
             "mode": r.get("mode", "Solid"),
             "j0": _safe_int(r.get("j0"), None),
@@ -448,27 +462,29 @@ def barrier_table_editor(N: int, gravity_on: bool) -> None:
             "thickness": max(1, _safe_int(r.get("thickness"), 1) or 1),
             "enabled": bool(r.get("enabled", False)),
         })
-    st.session_state.barrier_rows = cleaned
+    if cleaned_edit != rows_edit:
+        st.session_state.barrier_rows_user_edited = True
+    st.session_state.barrier_rows_edit = cleaned_edit
 
     c1, c2, c3, c4 = st.columns(4)
     with c1:
         if st.button("Add default barriers"):
-            st.session_state.barrier_rows += default_barrier_rows(N, gravity_on=gravity_on)
+            st.session_state.barrier_rows_edit += default_barrier_rows(N, gravity_on=gravity_on)
     with c2:
         if st.button("Clear all"):
-            st.session_state.barrier_rows = []
+            st.session_state.barrier_rows_edit = []
     with c3:
         if st.button("Disable all"):
-            for r in st.session_state.barrier_rows:
+            for r in st.session_state.barrier_rows_edit:
                 r["enabled"] = False
     with c4:
         if st.button("Apply barriers", type="primary"):
-            st.session_state.barrier_rows_applied = [r.copy() for r in st.session_state.barrier_rows]
+            st.session_state.barrier_rows_applied = [r.copy() for r in st.session_state.barrier_rows_edit]
             st.success("Applied barrier set for the next run")
 
     with st.expander("Preview", expanded=False):
         try:
-            preview_rows = st.session_state.get("barrier_rows", [])
+            preview_rows = st.session_state.get("barrier_rows_edit", [])
             preview_mask = build_barrier_mask_from_rows(int(N), preview_rows)
             if HAVE_MPL:
                 fig_prev, ax_prev = plt.subplots(figsize=(4, 4))
@@ -477,7 +493,7 @@ def barrier_table_editor(N: int, gravity_on: bool) -> None:
                     ax_prev.set_axis_off()
                 else:
                     ax_prev.imshow(preview_mask, origin="lower", interpolation="nearest", cmap="gray_r")
-                    ax_prev.set_title("Barrier mask (white = barrier)")
+                    ax_prev.set_title("Barrier mask, white = barrier")
                     ax_prev.set_xticks([]); ax_prev.set_yticks([])
                 st.pyplot(fig_prev, clear_figure=True)
                 plt.close(fig_prev)
@@ -763,7 +779,7 @@ tab_run, tab_bar, tab_res = st.tabs(["Run", "Barriers", "Results"])
 with tab_run:
     st.header("Run controls")
 
-    with st.expander("Basic setup", expanded=False):
+    with st.expander("Basic setup", expanded=True):
         cols = st.columns([1,1,1,1])
         with cols[0]:
             N   = st.number_input("Grid size N", min_value=21, max_value=401, value=int(_defaults.get("N", 99)), step=2)
@@ -896,12 +912,10 @@ with tab_run:
 
 with tab_bar:
     st.header("Barrier setup")
-    # seed barrier rows from config on first load only
     if CFG and CFG.get("barriers") and "seeded_from_cfg" not in st.session_state:
-        st.session_state.barrier_rows = CFG["barriers"].get("rows", [])
-        st.session_state.barrier_rows_applied = [r.copy() for r in st.session_state.barrier_rows]
+        st.session_state.barrier_rows_edit = CFG["barriers"].get("rows", [])
+        st.session_state.barrier_rows_applied = [r.copy() for r in st.session_state.barrier_rows_edit]
         st.session_state["seeded_from_cfg"] = True
-    # Use grid size and gravity from current or default params for sensible defaults if no config
     current_N = int(st.session_state.get("params", SimParams(N=int(_defaults.get("N", 99)))).N)
     current_grav_on = not bool(st.session_state.get("params", SimParams(disable_gravity=bool(_defaults.get("disable_gravity", False)))).disable_gravity)
     barrier_table_editor(current_N, current_grav_on)
@@ -912,23 +926,7 @@ with tab_res:
     disp_cols = st.columns([1,3])
     with disp_cols[0]:
         st.subheader("Display")
-        cmap_name_sel = st.selectbox(
-            "Colormap",
-            ["inferno", "magma", "viridis", "plasma", "cividis"],
-            index=["inferno","magma","viridis","plasma","cividis"].index(
-                st.session_state.get("cmap_name_live", "inferno")
-            )
-        )
-        gamma_sel = st.slider(
-            "Contrast (gamma)",
-            min_value=0.3, max_value=2.0,
-            value=float(st.session_state.get("gamma_live", 1.0)),
-            step=0.1
-        )
-        # Persist selections so both live and snapshots use them
-        st.session_state["cmap_name_live"] = cmap_name_sel
-        st.session_state["gamma_live"] = gamma_sel
-
+        cmap_name_sel
     res: Optional[SimResults] = st.session_state.get("results")
     col1, col2 = st.columns([2, 1])
 
@@ -989,21 +987,4 @@ with tab_res:
                 keys.append("T_cap_over_Ta")
             for key in keys:
                 ts = np.array(res.diagnostics.get(key, []))
-                if ts.size:
-                    ax3.plot(ts[:, 0], ts[:, 1], label=key)
-            ax3.set_xlabel("time step"); ax3.set_ylabel("value"); ax3.set_title("Diagnostics time series"); ax3.legend()
-            with col2:
-                st.pyplot(fig3, clear_figure=True)
-            plt.close(fig3)
-
-    # Export
-    if res is not None:
-        st.subheader("Export")
-        snaps = {f"t{t}": arr for t, arr in res.snapshots}
-        try:
-            import io
-            buf = io.BytesIO()
-            np.savez_compressed(buf, **snaps)
-            st.download_button("Download snapshots (npz)", data=buf.getvalue(), file_name="plume_snapshots.npz", mime="application/zip")
-        except Exception as e:
-            st.warning(f"Could not package snapshots: {e}")
+                
