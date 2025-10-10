@@ -228,17 +228,17 @@ def compute_flux_weights(Tp: float, Tn: Dict[str, float], *, params: SimParams) 
 # Barrier UI helpers (Phase 1)
 # =============================
 
-def default_barrier_rows(N: int, *, gravity_on: bool, thickness: int) -> List[Dict]:
-    """Seed a sensible default based on gravity setting."""
-    thickness = int(max(1, thickness))
+def default_barrier_rows(N: int, *, gravity_on: bool) -> List[Dict]:
+    """Seed a sensible default based on gravity setting. Default thickness = 1."""
+    thickness = 1
     if gravity_on:
         # Horizontal line starting at mid-height, spanning 1/4 to 2/3 width
         i = N // 2
         j0 = int(round(0.25 * (N - 1)))
         j1 = int(round((2.0 / 3.0) * (N - 1)))
-        return [{"type": "Line", "i0": i, "j0": j0, "i1": i, "j1": j1, "thickness": thickness, "enabled": True}]
+        return [{"type": "Line", "j0": j0, "i0": i, "j1": j1, "i1": i, "thickness": thickness, "enabled": True}]
     else:
-        # Rect block halfway between centre and top, 5 percent thick, same width span
+        # Rect block halfway between centre and top, ~5% thick, same width span
         centre = N // 2
         top = N - 1
         mid = int(round((centre + top) / 2))
@@ -247,12 +247,12 @@ def default_barrier_rows(N: int, *, gravity_on: bool, thickness: int) -> List[Di
         y1 = max(0, min(N - 1, y0 + h - 1))
         j0 = int(round(0.25 * (N - 1)))
         j1 = int(round((2.0 / 3.0) * (N - 1)))
-        return [{"type": "Rect", "i0": y0, "j0": j0, "i1": y1, "j1": j1, "thickness": thickness, "enabled": True}]
+        return [{"type": "Rect", "j0": j0, "i0": y0, "j1": j1, "i1": y1, "thickness": thickness, "enabled": True}]
 
 
-def ensure_barrier_rows_defaults(N: int, *, gravity_on: bool, thickness: int) -> None:
+def ensure_barrier_rows_defaults(N: int, *, gravity_on: bool) -> None:
     if "barrier_rows" not in st.session_state:
-        st.session_state.barrier_rows = default_barrier_rows(N, gravity_on=gravity_on, thickness=thickness)
+        st.session_state.barrier_rows = default_barrier_rows(N, gravity_on=gravity_on)
     if "prev_N" not in st.session_state:
         st.session_state.prev_N = int(N)
     if "prev_gravity_on" not in st.session_state:
@@ -260,7 +260,7 @@ def ensure_barrier_rows_defaults(N: int, *, gravity_on: bool, thickness: int) ->
     if st.session_state.prev_N != int(N) or st.session_state.prev_gravity_on != bool(gravity_on):
         st.session_state.prev_N = int(N)
         st.session_state.prev_gravity_on = bool(gravity_on)
-        st.session_state.barrier_rows = default_barrier_rows(N, gravity_on=gravity_on, thickness=thickness)
+        st.session_state.barrier_rows = default_barrier_rows(N, gravity_on=gravity_on)
 
 
 def _bresenham(i0: int, j0: int, i1: int, j1: int) -> List[Tuple[int, int]]:
@@ -311,7 +311,22 @@ def _apply_thickness(mask: np.ndarray, cells: List[Tuple[int, int]], radius: int
         mask[i0:i1+1, j0:j1+1] = True
 
 
-def build_barrier_mask_from_rows(N: int, rows: List[Dict], default_thickness: int) -> Optional[np.ndarray]:
+def _apply_thickness(mask: np.ndarray, cells: List[Tuple[int, int]], radius: int, value: bool = True) -> None:
+    """Dilate by Chebyshev radius around each cell, setting mask to value."""
+    N = mask.shape[0]
+    r = max(0, int(radius))
+    if r == 0:
+        for i, j in cells:
+            if 0 <= i < N and 0 <= j < N:
+                mask[i, j] = value
+        return
+    for i, j in cells:
+        i0 = max(0, i - r); i1 = min(N - 1, i + r)
+        j0 = max(0, j - r); j1 = min(N - 1, j + r)
+        mask[i0:i1+1, j0:j1+1] = value
+
+
+def build_barrier_mask_from_rows(N: int, rows: List[Dict]) -> Optional[np.ndarray]:
     if not rows:
         return None
     m = np.zeros((N, N), dtype=bool)
@@ -319,27 +334,34 @@ def build_barrier_mask_from_rows(N: int, rows: List[Dict], default_thickness: in
         if not row.get("enabled", True):
             continue
         typ = str(row.get("type", "Line"))
-        i0 = int(np.clip(row.get("i0", 0), 0, N-1))
+        # Note: UI uses j,x first: j0,i0,j1,i1
         j0 = int(np.clip(row.get("j0", 0), 0, N-1))
-        i1 = int(np.clip(row.get("i1", i0), 0, N-1))
+        i0 = int(np.clip(row.get("i0", 0), 0, N-1))
         j1 = int(np.clip(row.get("j1", j0), 0, N-1))
-        thick = int(row.get("thickness", default_thickness))
-        thick = max(1, thick)
-        radius = (thick - 1) // 2
+        i1 = int(np.clip(row.get("i1", i0), 0, N-1))
+        thick = int(row.get("thickness", 1) or 1)
+        radius = (abs(thick) - 1) // 2
         if typ.lower().startswith("line"):
             pts = _bresenham(i0, j0, i1, j1)
-            _apply_thickness(m, pts, radius)
+            if thick >= 0:
+                _apply_thickness(m, pts, radius, True)
+            else:
+                _apply_thickness(m, pts, radius, False)  # carve a hole
         elif typ.lower().startswith("rect"):
             cells = [(i, j) for i in range(min(i0, i1), max(i0, i1)+1)
                               for j in range(min(j0, j1), max(j0, j1)+1)]
-            _apply_thickness(m, cells, radius)
+            if thick >= 0:
+                _apply_thickness(m, cells, radius, True)
+            else:
+                _apply_thickness(m, cells, radius, False)
     return m if m.any() else None
 
 # Backward compatible builder: prefer table, else legacy rectangle
+: prefer table, else legacy rectangle
 
 def build_barrier_mask(N: int, p: SimParams) -> Optional[np.ndarray]:
     rows = st.session_state.get("barrier_rows", [])
-    m = build_barrier_mask_from_rows(N, rows, st.session_state.get("barrier_thickness", 1))
+    m = build_barrier_mask_from_rows(N, rows)
     if m is not None:
         return m
     if not p.barrier_enabled:
@@ -351,6 +373,7 @@ def build_barrier_mask(N: int, p: SimParams) -> Optional[np.ndarray]:
     mask = np.zeros((N, N), dtype=bool)
     mask[y0:y1+1, x0:x1+1] = True
     return mask
+
 
 # =============================
 # Background diffusion
@@ -566,42 +589,42 @@ def run_simulation(
 
 def barrier_table_editor(N: int, gravity_on: bool) -> None:
     st.subheader("Barriers (Phase 1)")
-    # Global thickness default
-    bt = st.slider("Global barrier thickness (cells)", 1, 9, st.session_state.get("barrier_thickness", 1), step=1)
-    st.session_state.barrier_thickness = int(bt)
-    ensure_barrier_rows_defaults(N, gravity_on=gravity_on, thickness=st.session_state.barrier_thickness)
+    # Ensure defaults present
+    ensure_barrier_rows_defaults(N, gravity_on=gravity_on)
 
     rows = st.session_state.barrier_rows
 
+    # Humans think x,y so show j before i
     colconf = {
         "type": st.column_config.SelectboxColumn("type", options=["Line", "Rect"], width="small"),
-        "i0": st.column_config.NumberColumn("i0", step=1, min_value=0, max_value=N-1),
-        "j0": st.column_config.NumberColumn("j0", step=1, min_value=0, max_value=N-1),
-        "i1": st.column_config.NumberColumn("i1", step=1, min_value=0, max_value=N-1),
-        "j1": st.column_config.NumberColumn("j1", step=1, min_value=0, max_value=N-1),
-        "thickness": st.column_config.NumberColumn("thickness", step=1, min_value=1, max_value=25),
+        "j0": st.column_config.NumberColumn("j0 (x0)", step=1, min_value=0, max_value=N-1),
+        "i0": st.column_config.NumberColumn("i0 (y0)", step=1, min_value=0, max_value=N-1),
+        "j1": st.column_config.NumberColumn("j1 (x1)", step=1, min_value=0, max_value=N-1),
+        "i1": st.column_config.NumberColumn("i1 (y1)", step=1, min_value=0, max_value=N-1),
+        # thickness can be negative to carve a hole
+        "thickness": st.column_config.NumberColumn("thickness (cells, negative = hole)", step=1, min_value=-25, max_value=25),
         "enabled": st.column_config.CheckboxColumn("enabled", default=True),
     }
 
     edited = st.data_editor(rows, num_rows="dynamic", column_config=colconf, use_container_width=True, key="barrier_rows_editor")
-    # Normalise edited rows into basic python list of dicts (Streamlit returns list[dict])
-    st.session_state.barrier_rows = [
-        {
+    # Normalise edited rows
+    norm_rows = []
+    for r in edited:
+        norm_rows.append({
             "type": r.get("type", "Line"),
-            "i0": int(r.get("i0", 0) or 0),
             "j0": int(r.get("j0", 0) or 0),
-            "i1": int(r.get("i1", 0) or 0),
+            "i0": int(r.get("i0", 0) or 0),
             "j1": int(r.get("j1", 0) or 0),
-            "thickness": int(r.get("thickness", st.session_state.barrier_thickness) or st.session_state.barrier_thickness),
+            "i1": int(r.get("i1", 0) or 0),
+            "thickness": int(r.get("thickness", 1) or 1),
             "enabled": bool(r.get("enabled", True)),
-        }
-        for r in edited
-    ]
+        })
+    st.session_state.barrier_rows = norm_rows
 
     c1, c2, c3 = st.columns(3)
     with c1:
         if st.button("Add default barrier"):
-            st.session_state.barrier_rows += default_barrier_rows(N, gravity_on=gravity_on, thickness=st.session_state.barrier_thickness)
+            st.session_state.barrier_rows += default_barrier_rows(N, gravity_on=gravity_on)
     with c2:
         if st.button("Clear all barriers"):
             st.session_state.barrier_rows = []
@@ -612,6 +635,15 @@ def barrier_table_editor(N: int, gravity_on: bool) -> None:
 
 
 def color_and_diffusion_controls() -> Tuple[str, float, float]:
+    st.subheader("Color mapping")
+    cmap_name = st.selectbox("Colormap", ["inferno", "magma", "viridis", "plasma", "cividis"], index=0, key="cmap_select")
+    gamma = st.slider("Contrast (gamma)", min_value=0.3, max_value=2.0, value=1.0, step=0.1, key="gamma_slider")
+    st.session_state.cmap_name_live = cmap_name
+    st.session_state.gamma_live = gamma
+    st.subheader("Background diffusion")
+    epsilon_diffusion = st.slider("Background diffusion ε", min_value=0.0, max_value=0.2, value=0.01, step=0.005)
+    return str(cmap_name), float(gamma), float(epsilon_diffusion)
+() -> Tuple[str, float, float]:
     st.subheader("Color mapping")
     cmap_name = st.selectbox("Colormap", ["inferno", "magma", "viridis", "plasma", "cividis"], index=0, key="cmap_select")
     gamma = st.slider("Contrast (gamma)", min_value=0.3, max_value=2.0, value=1.0, step=0.1, key="gamma_slider")
