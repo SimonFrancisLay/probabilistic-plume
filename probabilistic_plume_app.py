@@ -642,7 +642,7 @@ def color_and_diffusion_controls() -> Tuple[str, float, float]:
     st.subheader("Background diffusion")
     epsilon_diffusion = st.slider("Background diffusion ε", min_value=0.0, max_value=0.2, value=0.01, step=0.005)
     return str(cmap_name), float(gamma), float(epsilon_diffusion)
-() -> Tuple[str, float, float]:
+
     st.subheader("Color mapping")
     cmap_name = st.selectbox("Colormap", ["inferno", "magma", "viridis", "plasma", "cividis"], index=0, key="cmap_select")
     gamma = st.slider("Contrast (gamma)", min_value=0.3, max_value=2.0, value=1.0, step=0.1, key="gamma_slider")
